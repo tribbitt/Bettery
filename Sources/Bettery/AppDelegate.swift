@@ -530,11 +530,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.isApplyingChange = false
                 guard ok else { return }
                 self.appState.saverOn = on
-                // Recompute cached state and repaint the menu bar icon now,
-                // instead of waiting up to 5 sec for the next tick — otherwise
-                // toggling shows stale color until the timer fires.
+                // Recompute cached state and repaint everything now, instead of
+                // waiting up to 5 sec for the next tick — otherwise toggling shows
+                // stale color/title/graph until the timer fires.
                 let charging = self.battery.isCharging()
                 self.lastBatteryState = charging ? .charging : on ? .saverOn : .saverOff
+                self.history.append(percentage: self.lastBatteryPct, state: self.lastBatteryState)
+                self.updateMenuBarTitle(percentage: self.lastBatteryPct)
                 self.refreshIcon()
                 Notifier.shared.notifyToggle(saverOn: on)
             }
