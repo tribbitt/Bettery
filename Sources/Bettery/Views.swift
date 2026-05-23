@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
 // MARK: - Battery graph: continuous area chart, colored by battery state.
 //
@@ -315,9 +316,27 @@ struct OptionsView: View {
 
     @State private var showThresholds = false
     @State private var showAppearance = false
+    @State private var launchAtLogin: Bool = (SMAppService.mainApp.status == .enabled)
+
+    private func setLaunchAtLogin(_ on: Bool) {
+        do {
+            if on { try SMAppService.mainApp.register() }
+            else  { try SMAppService.mainApp.unregister() }
+            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+        } catch {
+            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+
+            toggleRow(label: "Launch at Login", value: Binding(
+                get: { launchAtLogin },
+                set: { setLaunchAtLogin($0) }
+            )).padding(.vertical, 4)
+
+            Divider()
 
             toggleRow(label: "Auto-Boost Performance", value: $settings.autoBoost)
                 .padding(.vertical, 4)
