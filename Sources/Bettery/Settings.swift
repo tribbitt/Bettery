@@ -31,6 +31,7 @@ final class Settings: ObservableObject {
         static let autoBoost = "autoBoost"
         static let notificationsEnabled = "notificationsEnabled"
         static let showPercentage = "showPercentage"
+        static let partyMode = "partyMode"
     }
 
     // MARK: - Defaults (constants used by both register-step and restore-buttons)
@@ -48,6 +49,7 @@ final class Settings: ObservableObject {
     static let defaultAutoBoost: Bool = true
     static let defaultNotificationsEnabled: Bool = true
     static let defaultShowPercentage: Bool = true
+    static let defaultPartyMode: Bool = false
 
     // Defaults match the previously hardcoded colors in BatteryGraphView.
     static let defaultStandardColor: Color = .white
@@ -90,6 +92,7 @@ final class Settings: ObservableObject {
     @Published var autoBoost: Bool             { didSet { defaults.set(autoBoost,             forKey: Keys.autoBoost) } }
     @Published var notificationsEnabled: Bool  { didSet { defaults.set(notificationsEnabled,  forKey: Keys.notificationsEnabled) } }
     @Published var showPercentage: Bool        { didSet { defaults.set(showPercentage,         forKey: Keys.showPercentage) } }
+    @Published var partyMode: Bool             { didSet { defaults.set(partyMode,              forKey: Keys.partyMode) } }
 
     private init() {
         defaults.register(defaults: [
@@ -106,6 +109,8 @@ final class Settings: ObservableObject {
             Keys.enableSmiley:    Self.defaultEnableSmiley,
             Keys.autoBoost:             Self.defaultAutoBoost,
             Keys.notificationsEnabled:  Self.defaultNotificationsEnabled,
+            Keys.showPercentage:        Self.defaultShowPercentage,
+            Keys.partyMode:             Self.defaultPartyMode
             Keys.showPercentage:        Self.defaultShowPercentage
         ])
         self.saverOnAtCPU         = defaults.double(forKey: Keys.cpuOn)
@@ -130,6 +135,7 @@ final class Settings: ObservableObject {
         self.autoBoost            = defaults.bool(forKey: Keys.autoBoost)
         self.notificationsEnabled = defaults.bool(forKey: Keys.notificationsEnabled)
         self.showPercentage       = defaults.bool(forKey: Keys.showPercentage)
+        self.partyMode            = defaults.bool(forKey: Keys.partyMode)
     }
 
     // MARK: - Restore
