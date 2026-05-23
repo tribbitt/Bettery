@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
+    private var wakeObserver: NSObjectProtocol?
     private var isApplyingChange = false
 
     // Cached last sample so the icon can be rebuilt off-tick when a Settings
@@ -79,13 +80,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         setupPanel()
         history.loadHistorical()
+        observeWake()
         startLoop()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let obs = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
         // Flush the trailing partial minute of live samples that the throttled
         // background save hasn't picked up yet.
         history.saveNow()
+    }
+
+    /// Re-parse pmset's log after every wake so just-ended sleep intervals
+    /// land in the graph immediately. Without this, sleeps shorter than the
+    /// 30-min live-gap heuristic in combinedSleepIntervals render as a normal
+    /// segment until the app is restarted. The 2.5-sec delay gives powerd
+    /// time to flush the Wake event into the log before we re-parse it.
+    private func observeWake() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                self?.history.loadHistorical()
+            }
+        }
     }
 
     // MARK: - Status item
