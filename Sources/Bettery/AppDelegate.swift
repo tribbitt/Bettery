@@ -165,6 +165,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.prevCharging = nil
             }
             .store(in: &cancellables)
+
+        // Apply saverOnWhileCharging immediately when toggled while plugged in.
+        // Without this, the setting only takes effect at the next plug-in event.
+        settings.$saverOnWhileCharging.dropFirst()
+            .sink { [weak self] newValue in
+                guard let self,
+                      !self.isApplyingChange,
+                      self.battery.isCharging() else { return }
+                let saverOn = self.battery.isLowPowerModeEnabled()
+                if newValue && !saverOn { self.applySaver(true) }
+                if !newValue && saverOn { self.applySaver(false) }
+            }
+            .store(in: &cancellables)
     }
 
     /// Updates the menu bar label to the current battery percentage. Called from
@@ -521,7 +534,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isApplyingChange else { return }
 
         let highLoad = cpu > settings.saverOffAtCPU || gpu > settings.saverOffAtGPU
+        let loadLow = cpu <= settings.saverOnAtCPU && gpu <= settings.saverOnAtGPU
         let battHealthy = batt > settings.saverOnAtBatt
+        // True iff the current power-source preference wants saver on right now.
+        let wantsSaver = !charging || settings.saverOnWhileCharging
         defer {
             prevHighLoad = highLoad
             prevBattHealthy = battHealthy
@@ -538,14 +554,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if settings.saverOnWhileCharging && !saverOn { applySaver(true); return }
             if !settings.saverOnWhileCharging && saverOn { applySaver(false); return }
         }
+        // Edge: just unplugged → turn ON saver (we're on battery now). Skip if
+        // load is currently high — don't constrain CPU during an active spike;
+        // the load-drop edge below will re-enable saver once load clears.
+        if wasCharging && !charging && !saverOn && loadLow {
+            applySaver(true)
+            return
+        }
         // Edge: load transitions low → high AND battery is healthy → turn OFF saver.
         if !wasHighLoad && highLoad && battHealthy && saverOn {
             applySaver(false)
             return
         }
-        // Edge: load transitions high → low (below the "on" threshold) → turn ON saver.
-        let loadLow = cpu <= settings.saverOnAtCPU && gpu <= settings.saverOnAtGPU
-        if wasHighLoad && loadLow && battHealthy && !charging && !saverOn {
+        // Edge: load transitions high → low (below the "on" threshold) → turn ON
+        // saver, but only if the current power-source preference wants it on.
+        if wasHighLoad && loadLow && battHealthy && wantsSaver && !saverOn {
             applySaver(true)
             return
         }
