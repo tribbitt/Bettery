@@ -6,12 +6,11 @@ A macOS menu-bar app that automatically toggles Low Power Mode based on CPU, GPU
 
 ## Features
 
-- **Auto-toggle Low Power Mode** when CPU or GPU usage crosses configurable thresholds
-- **Battery-level guard** — won't disable Low Power Mode if battery is too low
-- **Dynamic menu-bar icon** — fills like the native battery indicator with state-aware colors (charging, saver, low-battery)
+- **Auto-toggle Low Power Mode** when CPU or GPU usage crosses custom thresholds
+- **Low Power Threshold** — won't disable Low Power Mode if battery is too low
+- **Menu-bar icon** — fills like the native battery indicator with state-aware colors (charging, saver, low-battery). Plus a smiley! (that you can turn off)
 - **24-hour battery graph** — live samples overlaid on pmset history, color-coded by state with sleep hatching
-- **Appearance customization** — graph and fill colors, font, contrasty smiley overlay
-- **Passwordless toggling** — one-time sudoers rule install so pmset runs silently
+- **Customization** — graph and fill colors, font, contrasty smiley overlay
 
 ## Requirements
 
@@ -66,11 +65,12 @@ Click the battery icon in the menu bar to open the panel.
 
 **Options → Appearance**
 - Graph colors per state (Charging, Standard, Low-Power Mode, Sleep)
+- Battery Icon Fill colors per state (Charging, Standard, Low-Power Mode, Low Battery)
 - Menu bar fill colors + Enable Fill toggle
 - Font family
-- Contrasty Smiley — automatically adjusts the smiley icon color for maximum contrast against the current fill
+- Contrast Smiley — smiley turns black/white to show up against your selected fill color
 
-## Passwordless toggling
+## Energy Mode Toggling Permissions
 
 On first launch, a banner at the top of the panel offers to install a sudoers rule so `pmset` can run without a password prompt. This is a one-time step requiring admin credentials.
 
@@ -86,14 +86,10 @@ Battery history is stored at:
 ~/Library/Application Support/Bettery/history.json
 ```
 
-Deleting `Bettery.app` does **not** delete this file. The window retains 24 hours of data; older samples are pruned automatically.
+Deleting `Bettery.app` won't delete this file. The window retains 24 hours of data; older samples are pruned automatically.
 
 ## How it works
 
 Bettery polls CPU (`host_statistics`), GPU (IOAccelerator), and battery (IOKit) every 5 seconds. Toggling is edge-triggered — it only fires when load *crosses* a threshold, so manual overrides via System Settings are respected until the next crossing event.
 
 On first launch it back-fills the graph from `pmset -g log`, color-coded by the battery delta over each 10-minute bucket.
-
-## License
-
-MIT
