@@ -376,10 +376,13 @@ struct OptionsView: View {
                         .padding(.top, 4)
                     toggleRow(label: "Fill",          value: $settings.enableFill)
                     if settings.enableFill {
-                        colorRow(label: "Charging",       binding: $settings.fillChargingColor)
-                        colorRow(label: "Normal",         binding: $settings.fillStandardColor)
-                        colorRow(label: "Low-Power Mode", binding: $settings.fillSaverColor)
-                        colorRow(label: "Low-Battery",    binding: $settings.fillLowBatteryColor)
+                        toggleRow(label: "Party Mode", value: $settings.partyMode)
+                        if !settings.partyMode {
+                            colorRow(label: "Charging",       binding: $settings.fillChargingColor)
+                            colorRow(label: "Normal",         binding: $settings.fillStandardColor)
+                            colorRow(label: "Low-Power Mode", binding: $settings.fillSaverColor)
+                            colorRow(label: "Low-Battery",    binding: $settings.fillLowBatteryColor)
+                        }
                     }
 
                     fontRow().padding(.top, 4)

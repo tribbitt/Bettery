@@ -16,6 +16,11 @@ final class TopAnchoredPanel: NSPanel {
     // breaks any control that needs to present an auxiliary window (e.g.,
     // ColorPicker → NSColorPanel). Override to YES so focus + key handling work.
     override var canBecomeKey: Bool { true }
+    // NSPanel defaults canBecomeMain to NO. The modern SwiftUI ColorPicker
+    // presents its inline popover via NSColorWell, which refuses to show
+    // when the host window can't become main — so the swatch click appears
+    // to do nothing. Returning YES restores the popup.
+    override var canBecomeMain: Bool { true }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -66,6 +71,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         return (croppedCG, smileyCG, outlineCG, pxToPt)
     }()
+
+    // Party mode rainbow cycle. partyTimer drives 20 fps redraws while the
+    // toggle is on; partyHue is the current position in HSB space (0...1).
+    private var partyTimer: Timer?
+    private var partyHue: CGFloat = 0
 
     // Edge-triggered policy state — we only toggle on transitions, not while a
     // condition is sustained. Without this, the user's manual toggles get reverted
@@ -168,6 +178,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.reconcileSaverState()
             }
             .store(in: &cancellables)
+
+        // Start/stop the rainbow ticker when Party Mode flips. dropFirst so the
+        // initial @Published emission doesn't double-start with the launch kick
+        // below.
+        settings.$partyMode.dropFirst()
+            .sink { [weak self] on in
+                if on { self?.startPartyTimer() } else { self?.stopPartyTimer() }
+            }
+            .store(in: &cancellables)
+        if settings.partyMode { startPartyTimer() }
 
         // Apply saverOnWhileCharging immediately when toggled while plugged in.
         // Without this, the setting only takes effect at the next plug-in event.
@@ -274,7 +294,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and battery is below the saver-on threshold, the low-battery color
     /// takes precedence over the saver/standard state so the menu bar reads
     /// as "you need to plug in" rather than blending into the usual palette.
+    /// Party mode overrides everything — it's a deliberate UI gag, urgency
+    /// signals are forfeit until the user turns it off.
     private func fillColorForBattery(percentage: Double, state: BatteryState) -> Color {
+        if settings.partyMode {
+            return Color(hue: Double(partyHue), saturation: 1.0, brightness: 1.0)
+        }
         if state == .charging { return settings.fillChargingColor }
         if percentage < settings.saverOnAtBatt { return settings.fillLowBatteryColor }
         switch state {
@@ -282,6 +307,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .saverOff: return settings.fillStandardColor
         case .charging: return settings.fillChargingColor   // unreachable
         }
+    }
+
+    // ~6 sec per full hue cycle at 20 fps. Slow enough to read individual
+    // colors, fast enough to feel alive. Timer runs on .common so it keeps
+    // ticking during menu/scroll tracking.
+    private func startPartyTimer() {
+        guard partyTimer == nil else { return }
+        let t = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.partyHue = (self.partyHue + 1.0 / 120.0).truncatingRemainder(dividingBy: 1.0)
+            self.refreshIcon()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        partyTimer = t
+    }
+
+    private func stopPartyTimer() {
+        partyTimer?.invalidate()
+        partyTimer = nil
+        refreshIcon()
     }
 
     /// Extracts the smiley-only pixels from the cropped icon.
