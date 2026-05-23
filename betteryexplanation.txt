@@ -1,0 +1,52 @@
+betterysaver
+"betterysaver" (all lowercase) is an application that runs in the background of MacOS (should not appear in application selector or in dock). betterysaver borrows, stylistically, a lot from RunCat. 
+
+
+When CPU usage or GPU usage exceeds toggleThreshold (default 90%) AND battery percentage exceeds batteryLimit (default 25%), betterysaver toggles OFF battery saver on MacOS. 
+When CPU usage or GPU usage drops below toggleThreshold, betterysaver toggles ON battery saver. 
+
+betterysaver should issue a banner notification with no sound with the title:
+"bettersaver toggled battery mode"
+and text:
+"currently ON" or "currently OFF"
+respectively. 
+
+betterysaver's icons are in the directory /code/better-dump/betterysaver/icons/. They should be sized such that the icon is the same size as the native battery icon. 
+betteryIconBlack or betteryIconWhite are two different options to maximize contrast with background. 
+
+When clicking on betterysaver in menu, a dropdown opens with a graph (batteryGraph), options, and 2 switches.
+
+batteryGraph
+
+batteryGraph is the top of the dropdown. it uses a graph with the same style to Apple's native graph:
+When intial startup, we use MacOS's reporting of history. Keep this colored, but add diagonal crosshatch (bottom left to top
+  right) of half-transparent gray lines across it. When using our history, do not have crosshatch. When we're trusting
+  MacOS's sleep data, I no longer want it blue, and instead want gray with the same half-transparent crosshatches, but white
+  this time. Regular battery should be white, and battery saver should be the same yellow.
+
+  to summarize:
+
+  If it's MacOS history on initial startup (or if the app gets quit for a long time), it has crosshatches.
+  If it's MacOS history of sleeping (we cannot record this), it is gray with white crosshatches.
+  If it's our history, no crosshatches.
+
+  If it's sleeping, it can only be macos and should be gray with white crosshatches.
+  If it's awake, use white for standard battery and existing yellow for battery saver.
+
+Options >
+opens a seocnd dropdown:
+saver on @ cpu ____ %
+saver on @ gpu ____ %
+saver off @ cpu ____ %
+saver off @ gpu ____ %
+
+saver on @ battery ____ %
+
+saver on battery: (on/off)
+
+number input should be aligned on the right, text aligned on the left. 
+
+and at the bottom of main dropdown, 
+battery saver (on/off)
+
+toggle switch. using macos standard settings toggle

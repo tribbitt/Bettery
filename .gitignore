@@ -1,0 +1,19 @@
+# SwiftPM build artifacts
+.build/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Built app (distributed separately)
+*.app
+
+# Local dev session files
+.claude/
+CLAUDE.md
