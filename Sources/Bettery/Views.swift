@@ -340,6 +340,8 @@ struct OptionsView: View {
 
             toggleRow(label: "Auto-Boost Performance", value: $settings.autoBoost)
                 .padding(.vertical, 4)
+            toggleRow(label: "Notifications", value: $settings.notificationsEnabled)
+                .padding(.bottom, 4)
 
             if settings.autoBoost {
                 sectionHeader(label: "Toggle Thresholds", expanded: $showThresholds)
