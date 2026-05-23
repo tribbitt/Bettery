@@ -111,6 +111,7 @@ final class Settings: ObservableObject {
             Keys.notificationsEnabled:  Self.defaultNotificationsEnabled,
             Keys.showPercentage:        Self.defaultShowPercentage,
             Keys.partyMode:             Self.defaultPartyMode
+            Keys.showPercentage:        Self.defaultShowPercentage
         ])
         self.saverOnAtCPU         = defaults.double(forKey: Keys.cpuOn)
         self.saverOnAtGPU         = defaults.double(forKey: Keys.gpuOn)
