@@ -29,6 +29,7 @@ final class Settings: ObservableObject {
         static let enableFill = "enableFill"
         static let enableSmiley = "enableSmiley"
         static let autoBoost = "autoBoost"
+        static let notificationsEnabled = "notificationsEnabled"
         static let showPercentage = "showPercentage"
     }
 
@@ -45,6 +46,7 @@ final class Settings: ObservableObject {
     static let defaultEnableFill: Bool = true
     static let defaultEnableSmiley: Bool = true
     static let defaultAutoBoost: Bool = true
+    static let defaultNotificationsEnabled: Bool = true
     static let defaultShowPercentage: Bool = true
 
     // Defaults match the previously hardcoded colors in BatteryGraphView.
@@ -85,8 +87,9 @@ final class Settings: ObservableObject {
     @Published var contrastySmiley: Bool      { didSet { defaults.set(contrastySmiley, forKey: Keys.contrastySmiley) } }
     @Published var enableFill: Bool           { didSet { defaults.set(enableFill, forKey: Keys.enableFill) } }
     @Published var enableSmiley: Bool         { didSet { defaults.set(enableSmiley,     forKey: Keys.enableSmiley) } }
-    @Published var autoBoost: Bool            { didSet { defaults.set(autoBoost,        forKey: Keys.autoBoost) } }
-    @Published var showPercentage: Bool       { didSet { defaults.set(showPercentage,   forKey: Keys.showPercentage) } }
+    @Published var autoBoost: Bool             { didSet { defaults.set(autoBoost,             forKey: Keys.autoBoost) } }
+    @Published var notificationsEnabled: Bool  { didSet { defaults.set(notificationsEnabled,  forKey: Keys.notificationsEnabled) } }
+    @Published var showPercentage: Bool        { didSet { defaults.set(showPercentage,         forKey: Keys.showPercentage) } }
 
     private init() {
         defaults.register(defaults: [
@@ -101,8 +104,9 @@ final class Settings: ObservableObject {
             Keys.contrastySmiley: Self.defaultContrastySmiley,
             Keys.enableFill: Self.defaultEnableFill,
             Keys.enableSmiley:    Self.defaultEnableSmiley,
-            Keys.autoBoost:       Self.defaultAutoBoost,
-            Keys.showPercentage:  Self.defaultShowPercentage
+            Keys.autoBoost:             Self.defaultAutoBoost,
+            Keys.notificationsEnabled:  Self.defaultNotificationsEnabled,
+            Keys.showPercentage:        Self.defaultShowPercentage
         ])
         self.saverOnAtCPU         = defaults.double(forKey: Keys.cpuOn)
         self.saverOnAtGPU         = defaults.double(forKey: Keys.gpuOn)
@@ -124,6 +128,7 @@ final class Settings: ObservableObject {
         self.enableFill           = defaults.bool(forKey: Keys.enableFill)
         self.enableSmiley         = defaults.bool(forKey: Keys.enableSmiley)
         self.autoBoost            = defaults.bool(forKey: Keys.autoBoost)
+        self.notificationsEnabled = defaults.bool(forKey: Keys.notificationsEnabled)
         self.showPercentage       = defaults.bool(forKey: Keys.showPercentage)
     }
 

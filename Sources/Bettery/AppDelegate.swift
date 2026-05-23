@@ -550,7 +550,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.history.append(percentage: self.lastBatteryPct, state: self.lastBatteryState)
                 self.updateMenuBarTitle(percentage: self.lastBatteryPct)
                 self.refreshIcon()
-                Notifier.shared.notifyToggle(saverOn: on)
+                if self.settings.notificationsEnabled {
+                    Notifier.shared.notifyToggle(saverOn: on)
+                }
             }
         }
     }
