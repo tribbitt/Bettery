@@ -131,6 +131,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updateMenuBarTitle(percentage: self.lastBatteryPct)
             }
             .store(in: &cancellables)
+
+        // Reset edge-detection state when autoBoost is re-enabled so the first
+        // tick after re-enable doesn't fire a spurious edge against stale prevs.
+        settings.$autoBoost.dropFirst()
+            .filter { $0 }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.prevHighLoad = nil
+                self.prevBattHealthy = nil
+                self.prevCharging = nil
+            }
+            .store(in: &cancellables)
     }
 
     /// Updates the menu bar label to the current battery percentage. Called from
