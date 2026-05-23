@@ -63,4 +63,9 @@ cat > "$APP/Contents/Info.plist" << PLIST
 </plist>
 PLIST
 
+# Re-sign with the correct bundle identifier so the code signature matches
+# Info.plist — macOS uses the signature identifier (not Info.plist) to
+# register apps with UNUserNotificationCenter and other system services.
+codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP"
+
 echo "Built $APP"
