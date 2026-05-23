@@ -156,6 +156,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Reset edge-detection state when autoBoost is re-enabled so the first
         // tick after re-enable doesn't fire a spurious edge against stale prevs.
+        // Also reconcile current state immediately so the policy kicks in now
+        // instead of waiting for a transition that may never come.
         settings.$autoBoost.dropFirst()
             .filter { $0 }
             .sink { [weak self] _ in
@@ -163,6 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.prevHighLoad = nil
                 self.prevBattHealthy = nil
                 self.prevCharging = nil
+                self.reconcileSaverState()
             }
             .store(in: &cancellables)
 
@@ -602,5 +605,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func manualToggle(_ on: Bool) { applySaver(on) }
+    // User flipped the saver in our menu. Disable autoBoost so the auto policy
+    // doesn't immediately undo their choice on the next tick — the user re-enables
+    // autoBoost when they want the system to take over again.
+    private func manualToggle(_ on: Bool) {
+        settings.autoBoost = false
+        applySaver(on)
+    }
+
+    /// Compute the saver state that autoBoost would currently want, and apply it
+    /// if different from the live state. Called when autoBoost is re-enabled so
+    /// the policy kicks in immediately instead of waiting for the next state
+    /// transition (which might never come).
+    private func reconcileSaverState() {
+        guard !isApplyingChange else { return }
+        let cpu = monitor.sampleCPU()
+        let gpu = monitor.sampleGPU()
+        let batt = battery.batteryPercentage() ?? 100
+        let charging = battery.isCharging()
+        let saverOn = battery.isLowPowerModeEnabled()
+
+        let highLoad = cpu > settings.saverOffAtCPU || gpu > settings.saverOffAtGPU
+        let battHealthy = batt > settings.saverOnAtBatt
+        let wantsSaver = !charging || settings.saverOnWhileCharging
+
+        let desired: Bool
+        if !battHealthy {
+            desired = true                  // low battery overrides everything
+        } else if highLoad && wantsSaver {
+            desired = false                 // high load — back off temporarily
+        } else {
+            desired = wantsSaver
+        }
+
+        if desired != saverOn { applySaver(desired) }
+    }
 }
