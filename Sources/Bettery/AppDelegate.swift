@@ -509,6 +509,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             applySaver(false)
             return
         }
+        // Edge: load transitions high → low (below the "on" threshold) → turn ON saver.
+        let loadLow = cpu <= settings.saverOnAtCPU && gpu <= settings.saverOnAtGPU
+        if wasHighLoad && loadLow && battHealthy && !charging && !saverOn {
+            applySaver(true)
+            return
+        }
         // Edge: battery crosses below the threshold → turn ON saver.
         if wasBattHealthy && !battHealthy && !saverOn {
             applySaver(true)
