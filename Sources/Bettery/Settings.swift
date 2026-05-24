@@ -31,7 +31,10 @@ final class Settings: ObservableObject {
         static let autoBoost = "autoBoost"
         static let notificationsEnabled = "notificationsEnabled"
         static let showPercentage = "showPercentage"
-        static let partyMode = "partyMode"
+        static let fillChargingParty   = "fillChargingParty"
+        static let fillStandardParty   = "fillStandardParty"
+        static let fillSaverParty      = "fillSaverParty"
+        static let fillLowBatteryParty = "fillLowBatteryParty"
     }
 
     // MARK: - Defaults (constants used by both register-step and restore-buttons)
@@ -49,7 +52,7 @@ final class Settings: ObservableObject {
     static let defaultAutoBoost: Bool = true
     static let defaultNotificationsEnabled: Bool = true
     static let defaultShowPercentage: Bool = true
-    static let defaultPartyMode: Bool = false
+    static let defaultFillParty: Bool = false
 
     // Defaults match the previously hardcoded colors in BatteryGraphView.
     static let defaultStandardColor: Color = .white
@@ -92,7 +95,13 @@ final class Settings: ObservableObject {
     @Published var autoBoost: Bool             { didSet { defaults.set(autoBoost,             forKey: Keys.autoBoost) } }
     @Published var notificationsEnabled: Bool  { didSet { defaults.set(notificationsEnabled,  forKey: Keys.notificationsEnabled) } }
     @Published var showPercentage: Bool        { didSet { defaults.set(showPercentage,         forKey: Keys.showPercentage) } }
-    @Published var partyMode: Bool             { didSet { defaults.set(partyMode,              forKey: Keys.partyMode) } }
+    // Per-state Party Mode flags. When the icon's current fill state has its
+    // flag on, the fill (or smiley if fill is disabled) cycles through the
+    // precomputed rainbow LUT instead of using its static color.
+    @Published var fillChargingParty: Bool     { didSet { defaults.set(fillChargingParty,      forKey: Keys.fillChargingParty) } }
+    @Published var fillStandardParty: Bool     { didSet { defaults.set(fillStandardParty,      forKey: Keys.fillStandardParty) } }
+    @Published var fillSaverParty: Bool        { didSet { defaults.set(fillSaverParty,         forKey: Keys.fillSaverParty) } }
+    @Published var fillLowBatteryParty: Bool   { didSet { defaults.set(fillLowBatteryParty,    forKey: Keys.fillLowBatteryParty) } }
 
     private init() {
         defaults.register(defaults: [
@@ -110,8 +119,10 @@ final class Settings: ObservableObject {
             Keys.autoBoost:             Self.defaultAutoBoost,
             Keys.notificationsEnabled:  Self.defaultNotificationsEnabled,
             Keys.showPercentage:        Self.defaultShowPercentage,
-            Keys.partyMode:             Self.defaultPartyMode
-            Keys.showPercentage:        Self.defaultShowPercentage
+            Keys.fillChargingParty:     Self.defaultFillParty,
+            Keys.fillStandardParty:     Self.defaultFillParty,
+            Keys.fillSaverParty:        Self.defaultFillParty,
+            Keys.fillLowBatteryParty:   Self.defaultFillParty
         ])
         self.saverOnAtCPU         = defaults.double(forKey: Keys.cpuOn)
         self.saverOnAtGPU         = defaults.double(forKey: Keys.gpuOn)
@@ -135,7 +146,10 @@ final class Settings: ObservableObject {
         self.autoBoost            = defaults.bool(forKey: Keys.autoBoost)
         self.notificationsEnabled = defaults.bool(forKey: Keys.notificationsEnabled)
         self.showPercentage       = defaults.bool(forKey: Keys.showPercentage)
-        self.partyMode            = defaults.bool(forKey: Keys.partyMode)
+        self.fillChargingParty    = defaults.bool(forKey: Keys.fillChargingParty)
+        self.fillStandardParty    = defaults.bool(forKey: Keys.fillStandardParty)
+        self.fillSaverParty       = defaults.bool(forKey: Keys.fillSaverParty)
+        self.fillLowBatteryParty  = defaults.bool(forKey: Keys.fillLowBatteryParty)
     }
 
     // MARK: - Restore
@@ -149,6 +163,10 @@ final class Settings: ObservableObject {
         fillStandardColor   = Self.defaultFillStandard
         fillSaverColor      = Self.defaultFillSaver
         fillLowBatteryColor = Self.defaultFillLowBattery
+        fillChargingParty   = Self.defaultFillParty
+        fillStandardParty   = Self.defaultFillParty
+        fillSaverParty      = Self.defaultFillParty
+        fillLowBatteryParty = Self.defaultFillParty
         fontFamily          = Self.defaultFontFamily
         contrastySmiley     = Self.defaultContrastySmiley
         enableFill          = Self.defaultEnableFill
@@ -196,5 +214,38 @@ final class Settings: ObservableObject {
               let ns = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSColor.self, from: data)
         else { return fallback }
         return Color(nsColor: ns)
+    }
+}
+
+// MARK: - Slot-keyed bindings
+// Used so views can ForEach over FillSlot.allCases without each row
+// hand-naming the field. FillSlot itself is defined in Views.swift so it
+// can be referenced from SwiftUI and AppKit code uniformly.
+
+extension Settings {
+    func fillColor(for slot: FillSlot) -> Binding<Color> {
+        switch slot {
+        case .charging:   return Binding(get: { self.fillChargingColor },   set: { self.fillChargingColor = $0 })
+        case .standard:   return Binding(get: { self.fillStandardColor },   set: { self.fillStandardColor = $0 })
+        case .saver:      return Binding(get: { self.fillSaverColor },      set: { self.fillSaverColor = $0 })
+        case .lowBattery: return Binding(get: { self.fillLowBatteryColor }, set: { self.fillLowBatteryColor = $0 })
+        }
+    }
+    func partyFlag(for slot: FillSlot) -> Binding<Bool> {
+        switch slot {
+        case .charging:   return Binding(get: { self.fillChargingParty },   set: { self.fillChargingParty = $0 })
+        case .standard:   return Binding(get: { self.fillStandardParty },   set: { self.fillStandardParty = $0 })
+        case .saver:      return Binding(get: { self.fillSaverParty },      set: { self.fillSaverParty = $0 })
+        case .lowBattery: return Binding(get: { self.fillLowBatteryParty }, set: { self.fillLowBatteryParty = $0 })
+        }
+    }
+    /// Read-only for the icon renderer's hot path — avoids Binding overhead.
+    func isParty(for slot: FillSlot) -> Bool {
+        switch slot {
+        case .charging:   return fillChargingParty
+        case .standard:   return fillStandardParty
+        case .saver:      return fillSaverParty
+        case .lowBattery: return fillLowBatteryParty
+        }
     }
 }

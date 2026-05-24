@@ -24,7 +24,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     func notifyToggle(saverOn: Bool) {
         let content = UNMutableNotificationContent()
-        content.title = "Bettery Toggled Battery Mode"
+        content.title = "Bettery Toggled Low-Power Mode"
         content.body = saverOn ? "Currently On" : "Currently Off"
         content.sound = nil
 

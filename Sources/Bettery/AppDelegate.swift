@@ -2,6 +2,15 @@ import AppKit
 import SwiftUI
 import Combine
 
+private extension Publisher where Failure == Never {
+    /// Drops the initial @Published emission and erases the element type so
+    /// many publishers with different values can MergeMany together to drive
+    /// a single side-effect sink.
+    func voidChanges() -> AnyPublisher<Void, Never> {
+        dropFirst().map { _ in () }.eraseToAnyPublisher()
+    }
+}
+
 /// A panel that, once anchored, keeps its TOP edge fixed across any frame change —
 /// so when the hosting controller resizes the panel (e.g., options expanding),
 /// the panel grows downward instead of upward into the menu bar.
@@ -37,7 +46,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
     private var wakeObserver: NSObjectProtocol?
+    private var screenSleepObserver: NSObjectProtocol?
+    private var screenWakeObserver: NSObjectProtocol?
     private var isApplyingChange = false
+    // True while display is asleep — party timer is paused regardless of toggle
+    // state because cycling colors no one can see is pure waste.
+    private var screenAsleep = false
 
     // Cached last sample so the icon can be rebuilt off-tick when a Settings
     // color change comes through. Without this, the menu bar wouldn't update
@@ -72,10 +86,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (croppedCG, smileyCG, outlineCG, pxToPt)
     }()
 
-    // Party mode rainbow cycle. partyTimer drives 20 fps redraws while the
-    // toggle is on; partyHue is the current position in HSB space (0...1).
-    private var partyTimer: Timer?
-    private var partyHue: CGFloat = 0
+    // Party mode rainbow cycle. We hand the rasterized frames to a
+    // CAKeyframeAnimation on a CALayer sublayer of the menu-bar button —
+    // Core Animation runs the animation on the render server, so our process
+    // does ~zero per-frame work after setup (vs. a Timer-driven button.image
+    // setter, which forces an NSStatusItem layout+repaint every frame).
+    // partyFrame is no longer per-tick state, but cache building still iterates
+    // it 0..<partyFrames to produce one frame per hue step.
+    private var partyFrame: Int = 0
+    private var partyIconLayer: CALayer?
+    private var partyAnimationKey: PartyCacheKey?
+
+    /// Cache of pre-rasterized icon frames while in party. Per-frame cost
+    /// drops to one array lookup + button.image assignment; full composedIcon
+    /// only runs at cache (re)build. The closure-based NSImage from
+    /// composedIcon is rasterized to a CGImage immediately so it doesn't
+    /// re-execute against possibly-mutated settings at display time.
+    private struct PartyCacheKey: Equatable {
+        let pct: Int                // rounded — sub-int fill-width is invisible
+        let enableFill: Bool
+        let enableSmiley: Bool
+        let contrastySmiley: Bool
+    }
+    private var partyCache: (key: PartyCacheKey, images: [NSImage])?
 
     // Edge-triggered policy state — we only toggle on transitions, not while a
     // condition is sustained. Without this, the user's manual toggles get reverted
@@ -89,15 +122,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.saverOn = battery.isLowPowerModeEnabled()
         setupStatusItem()
         setupPanel()
+        setupColorPanelAccessory()
         history.loadHistorical()
         observeWake()
         startLoop()
+        // Settling reconcile 30 sec in: gives IOKit power-source readings and
+        // the first CPU/GPU samples time to stabilize before we apply policy.
+        // Catches cases where launch happened mid-transition (e.g. just woke
+        // from sleep, charger state still flapping).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            self?.reconcileBehavior()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let obs = wakeObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(obs)
-        }
+        let nc = NSWorkspace.shared.notificationCenter
+        [wakeObserver, screenSleepObserver, screenWakeObserver]
+            .compactMap { $0 }
+            .forEach { nc.removeObserver($0) }
         // Flush the trailing partial minute of live samples that the throttled
         // background save hasn't picked up yet.
         history.saveNow()
@@ -109,7 +151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// segment until the app is restarted. The 2.5-sec delay gives powerd
     /// time to flush the Wake event into the log before we re-parse it.
     private func observeWake() {
-        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+        let nc = NSWorkspace.shared.notificationCenter
+        wakeObserver = nc.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
             queue: .main
@@ -117,6 +160,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                 self?.history.loadHistorical()
             }
+        }
+        // Pause party animation while the display is asleep — invisible work.
+        // Timer only runs when a state's party flag is on anyway, and the
+        // wake handler re-checks before restarting.
+        screenSleepObserver = nc.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.screenAsleep = true
+            self.stopPartyAnimation()
+        }
+        screenWakeObserver = nc.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.screenAsleep = false
+            self.syncPartyTimer()
         }
     }
 
@@ -133,29 +197,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.imageHugsTitle = true
             button.action = #selector(togglePanel(_:))
             button.target = self
+            // Sublayer hosts the party-mode CAKeyframeAnimation. Sits on top of
+            // the button's title-area rendering; we align its frame to the
+            // cell's imageRect so it overlays exactly where button.image
+            // would be drawn. Hidden until party state is active.
+            button.wantsLayer = true
+            if let buttonLayer = button.layer {
+                let layer = CALayer()
+                // Disable implicit animations on every property we mutate —
+                // otherwise frame updates cross-fade and contents swaps blur.
+                layer.actions = [
+                    "contents": NSNull(),
+                    "hidden": NSNull(),
+                    "bounds": NSNull(),
+                    "position": NSNull(),
+                ]
+                layer.contentsGravity = .resizeAspect
+                layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+                layer.isHidden = true
+                buttonLayer.addSublayer(layer)
+                partyIconLayer = layer
+            }
         }
         refreshIcon()
 
-        // Rebuild the icon whenever any fill color changes — without this the
-        // menu bar wouldn't reflect a freshly picked color until the next tick.
-        // dropFirst suppresses the initial CurrentValueSubject emission so we
-        // don't double-rebuild during setup. objectWillChange would fire BEFORE
-        // the @Published assignment lands, so we'd read the stale color — must
-        // subscribe to the publishers themselves.
-        let colorTriggers = [
-            settings.$fillChargingColor,
-            settings.$fillStandardColor,
-            settings.$fillSaverColor,
-            settings.$fillLowBatteryColor
-        ].map { $0.dropFirst().map { _ in () }.eraseToAnyPublisher() }
-        let toggleTriggers = [
-            settings.$contrastySmiley.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            settings.$enableFill.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            settings.$enableSmiley.dropFirst().map { _ in () }.eraseToAnyPublisher()
-        ]
-        Publishers.MergeMany(colorTriggers + toggleTriggers)
-            .sink { [weak self] in self?.refreshIcon() }
-            .store(in: &cancellables)
+        // Rebuild the icon when any appearance input changes. Subscribing to
+        // the @Published publisher directly (not objectWillChange) is required
+        // because objectWillChange fires *before* the new value lands.
+        Publishers.MergeMany([
+            settings.$fillChargingColor.voidChanges(),
+            settings.$fillStandardColor.voidChanges(),
+            settings.$fillSaverColor.voidChanges(),
+            settings.$fillLowBatteryColor.voidChanges(),
+            settings.$contrastySmiley.voidChanges(),
+            settings.$enableFill.voidChanges(),
+            settings.$enableSmiley.voidChanges(),
+        ])
+        .sink { [weak self] in self?.refreshIcon() }
+        .store(in: &cancellables)
 
         settings.$showPercentage.dropFirst()
             .sink { [weak self] _ in
@@ -164,59 +243,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // Reset edge-detection state when autoBoost is re-enabled so the first
-        // tick after re-enable doesn't fire a spurious edge against stale prevs.
-        // Also reconcile current state immediately so the policy kicks in now
-        // instead of waiting for a transition that may never come.
+        // Reset edge-detection state when autoBoost re-enables so the first
+        // post-enable tick doesn't fire a spurious edge against stale prevs.
         settings.$autoBoost.dropFirst()
             .filter { $0 }
             .sink { [weak self] _ in
+                self?.prevHighLoad = nil
+                self?.prevBattHealthy = nil
+                self?.prevCharging = nil
+            }
+            .store(in: &cancellables)
+
+        // Re-evaluate intended behavior whenever any performance/threshold
+        // setting changes. reconcileBehavior() applies the autoBoost policy
+        // immediately and resyncs the fill color — e.g. raising saverOnAtBatt
+        // above the current % should flip the icon to low-battery red now.
+        Publishers.MergeMany([
+            settings.$autoBoost.voidChanges(),
+            settings.$saverOnWhileCharging.voidChanges(),
+            settings.$saverOnAtCPU.voidChanges(),
+            settings.$saverOffAtCPU.voidChanges(),
+            settings.$saverOnAtGPU.voidChanges(),
+            settings.$saverOffAtGPU.voidChanges(),
+            settings.$saverOnAtBatt.voidChanges(),
+        ])
+        .sink { [weak self] in self?.reconcileBehavior() }
+        .store(in: &cancellables)
+
+        // Start/stop the rainbow ticker on any per-state Party flag change.
+        // syncPartyTimer also picks the right action based on the *current*
+        // state, so flipping a flag for an inactive state correctly does
+        // nothing visible until that state becomes active.
+        Publishers.MergeMany([
+            settings.$fillChargingParty.voidChanges(),
+            settings.$fillStandardParty.voidChanges(),
+            settings.$fillSaverParty.voidChanges(),
+            settings.$fillLowBatteryParty.voidChanges(),
+        ])
+        .sink { [weak self] in self?.syncPartyTimer() }
+        .store(in: &cancellables)
+        syncPartyTimer()
+    }
+
+    /// Wires the NSColorPanel accessory view to the *currently-open* fill
+    /// picker's Party flag. SwiftUI ColorPicker forwards to the system
+    /// NSColorPanel singleton, whose swatch UI isn't customizable; the panel's
+    /// accessoryView slot is the closest macOS allows to "inside the color
+    /// picker." Each fill picker row sets appState.activeFillSlot via a
+    /// simultaneousGesture; this observer rebuilds the hosted accessory view
+    /// to bind the toggle to that slot's flag. Graph picker rows clear the
+    /// slot, removing the accessory.
+    ///
+    /// NSColorPanel close also clears the slot so a stale toggle doesn't
+    /// reappear next time the panel opens.
+    private func setupColorPanelAccessory() {
+        appState.$activeFillSlot
+            .removeDuplicates()
+            .sink { [weak self] slot in
                 guard let self else { return }
-                self.prevHighLoad = nil
-                self.prevBattHealthy = nil
-                self.prevCharging = nil
-                self.reconcileSaverState()
+                if let slot = slot {
+                    let hosting = NSHostingView(rootView: ColorPanelAccessory(settings: self.settings, slot: slot))
+                    hosting.frame = NSRect(x: 0, y: 0, width: 260, height: 36)
+                    NSColorPanel.shared.accessoryView = hosting
+                } else {
+                    NSColorPanel.shared.accessoryView = nil
+                }
             }
             .store(in: &cancellables)
 
-        // Start/stop the rainbow ticker when Party Mode flips. dropFirst so the
-        // initial @Published emission doesn't double-start with the launch kick
-        // below.
-        settings.$partyMode.dropFirst()
-            .sink { [weak self] on in
-                if on { self?.startPartyTimer() } else { self?.stopPartyTimer() }
-            }
-            .store(in: &cancellables)
-        if settings.partyMode { startPartyTimer() }
-
-        // Apply saverOnWhileCharging immediately when toggled while plugged in.
-        // Without this, the setting only takes effect at the next plug-in event.
-        settings.$saverOnWhileCharging.dropFirst()
-            .sink { [weak self] newValue in
-                guard let self,
-                      !self.isApplyingChange,
-                      self.battery.isCharging() else { return }
-                let saverOn = self.battery.isLowPowerModeEnabled()
-                if newValue && !saverOn { self.applySaver(true) }
-                if !newValue && saverOn { self.applySaver(false) }
-            }
-            .store(in: &cancellables)
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: NSColorPanel.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.appState.activeFillSlot = nil
+        }
     }
 
     /// Updates the menu bar label to the current battery percentage. Called from
     /// the 5-sec tick — cheap, just an NSButton title swap.
     private func updateMenuBarTitle(percentage: Double) {
-        guard settings.showPercentage else {
-            statusItem.button?.title = ""
-            return
+        let newTitle: String
+        if settings.showPercentage {
+            let pct = max(0, min(100, Int(percentage.rounded())))
+            newTitle = "\(pct)%"
+        } else {
+            newTitle = ""
         }
-        let pct = max(0, min(100, Int(percentage.rounded())))
-        statusItem.button?.title = "\(pct)%"
+        guard statusItem.button?.title != newTitle else { return }
+        statusItem.button?.title = newTitle
+        // Title-width change shifts the cell's imageRect, so the party
+        // sublayer needs to re-align. Async so the button has laid out.
+        if partyAnimationKey != nil {
+            DispatchQueue.main.async { [weak self] in self?.updatePartyLayerFrame() }
+        }
     }
 
     /// Rebuilds and assigns the menu bar icon from the cached last sample.
+    /// In party mode this hands the rasterized frames to Core Animation as
+    /// a CAKeyframeAnimation on a sublayer's contents — per-frame compositing
+    /// runs in the render server, so our process does essentially no work
+    /// while party is active.
     private func refreshIcon() {
-        statusItem.button?.image = composedIcon(percentage: lastBatteryPct, state: lastBatteryState)
+        guard let button = statusItem.button else { return }
+        if currentStateIsParty && !screenAsleep {
+            ensurePartyAnimation()
+        } else {
+            stopPartyAnimation()
+            partyCache = nil
+            button.image = composedIcon(percentage: lastBatteryPct, state: lastBatteryState)
+        }
+    }
+
+    /// Rasterizes one icon per party frame. Returning the closure-based
+    /// NSImage directly would re-run composedIcon's draw block each time the
+    /// status item asked for the bitmap — which defeats the cache. The
+    /// cgImage(forProposedRect:context:hints:) call forces eager rendering;
+    /// the result is wrapped back into NSImage for status-item assignment.
+    private func buildPartyImageCache() -> [NSImage] {
+        var out: [NSImage] = []
+        out.reserveCapacity(Self.partyFrames)
+        let saved = partyFrame
+        for f in 0..<Self.partyFrames {
+            partyFrame = f
+            if let img = composedIcon(percentage: lastBatteryPct, state: lastBatteryState),
+               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                out.append(NSImage(cgImage: cg, size: img.size))
+            }
+        }
+        partyFrame = saved
+        return out
     }
 
     /// Composes the menu bar icon: a state-colored fill rect (width = battery %)
@@ -231,7 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             height: CGFloat(assets.croppedCG.height) * assets.pxToPt * scale
         )
         let fillFraction = max(0, min(1, percentage / 100.0))
-        let fillColor = NSColor(fillColorForBattery(percentage: percentage, state: state))
+        let fillColor = fillNSColorForBattery(percentage: percentage, state: state)
 
         let img = NSImage(size: renderSize, flipped: false) { rect in
             // Fill sits inside the battery body with a transparent gap on all
@@ -272,10 +428,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             if self.settings.enableSmiley, let smiley = assets.smileyCG {
-                let smileyColor: NSColor = self.settings.contrastySmiley
-                    ? self.contrastNSColor(for: self.fillColorForBattery(
-                        percentage: percentage, state: state))
-                    : .white
+                // Party + Fill off: paint the smiley with the cycling hue so
+                // Party Mode has a visible surface even without the fill rect.
+                let smileyColor: NSColor
+                if self.isPartyState(percentage: percentage, state: state) && !self.settings.enableFill {
+                    smileyColor = fillColor
+                } else if self.settings.contrastySmiley {
+                    smileyColor = self.contrastNSColor(forNS: fillColor)
+                } else {
+                    smileyColor = .white
+                }
                 let tinted = NSImage(size: rect.size, flipped: false) { drawRect in
                     NSImage(cgImage: smiley, size: drawRect.size).draw(in: drawRect)
                     smileyColor.set()
@@ -294,39 +456,197 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and battery is below the saver-on threshold, the low-battery color
     /// takes precedence over the saver/standard state so the menu bar reads
     /// as "you need to plug in" rather than blending into the usual palette.
-    /// Party mode overrides everything — it's a deliberate UI gag, urgency
-    /// signals are forfeit until the user turns it off.
-    private func fillColorForBattery(percentage: Double, state: BatteryState) -> Color {
-        if settings.partyMode {
-            return Color(hue: Double(partyHue), saturation: 1.0, brightness: 1.0)
-        }
-        if state == .charging { return settings.fillChargingColor }
-        if percentage < settings.saverOnAtBatt { return settings.fillLowBatteryColor }
-        switch state {
-        case .saverOn:  return settings.fillSaverColor
-        case .saverOff: return settings.fillStandardColor
-        case .charging: return settings.fillChargingColor   // unreachable
+    /// Each state independently honors its Party flag.
+    ///
+    /// Which FillSlot drives the icon for the given (pct, state). Single
+    /// source of truth — fillNSColorForBattery and isPartyState both go
+    /// through here so the color and the timer stay in lock-step.
+    private func fillSlot(percentage: Double, state: BatteryState) -> FillSlot {
+        if state == .charging { return .charging }
+        if percentage < settings.saverOnAtBatt { return .lowBattery }
+        return state == .saverOn ? .saver : .standard
+    }
+
+    /// Returns NSColor directly (not SwiftUI Color) so the party hot path
+    /// avoids the SwiftUI→AppKit bridging conversion 12×/sec.
+    private func fillNSColorForBattery(percentage: Double, state: BatteryState) -> NSColor {
+        let slot = fillSlot(percentage: percentage, state: state)
+        if settings.isParty(for: slot) { return Self.partyColor(frame: partyFrame) }
+        return NSColor(settings.fillColor(for: slot).wrappedValue)
+    }
+
+    private func isPartyState(percentage: Double, state: BatteryState) -> Bool {
+        settings.isParty(for: fillSlot(percentage: percentage, state: state))
+    }
+
+    private var currentStateIsParty: Bool {
+        isPartyState(percentage: lastBatteryPct, state: lastBatteryState)
+    }
+
+    /// Start the rainbow animation iff the *current* fill slot wants party.
+    /// State transitions (tick, applySaver, screen wake) and per-state flag
+    /// changes all call this — single decision point for animation lifecycle.
+    private func syncPartyTimer() {
+        if currentStateIsParty && !screenAsleep {
+            ensurePartyAnimation()
+        } else {
+            stopPartyAnimation()
+            // Restore the static state-colored icon if we just left party.
+            if !currentStateIsParty, let button = statusItem.button {
+                button.image = composedIcon(percentage: lastBatteryPct, state: lastBatteryState)
+            }
         }
     }
 
-    // ~6 sec per full hue cycle at 20 fps. Slow enough to read individual
-    // colors, fast enough to feel alive. Timer runs on .common so it keeps
-    // ticking during menu/scroll tracking.
-    private func startPartyTimer() {
-        guard partyTimer == nil else { return }
-        let t = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.partyHue = (self.partyHue + 1.0 / 120.0).truncatingRemainder(dividingBy: 1.0)
-            self.refreshIcon()
+    // Party-mode color LUT: one NSColor per cycle frame, generated once at
+    // first access. Each entry is a 50/50 sRGB blend of:
+    //   - OKLCh(L=0.72, max in-gamut C) — perceptually uniform brightness
+    //   - HSB(s=1, v=1)                 — maximally vivid but brightness varies
+    // The blend lands halfway between "no flash" and "vivid but flashy":
+    // perceived Δluma over the cycle ~0.30 (vs ~0.06 for pure OKLCh, ~0.7 for
+    // pure HSB) while keeping chroma higher than the pure-OKLCh version.
+    //
+    // Per-frame runtime cost is one array lookup — no math, no allocation.
+    // All the OKLab + gamut-search work happens once when the static is first
+    // touched. Memory cost: 60 NSColor references ≈ 1 KB.
+    //
+    // Why a LUT and not a video file: NSStatusItem renders an NSImage. A video
+    // pipeline (AVPlayer + CVDisplayLink + CGImage extraction) would be more
+    // moving parts and decode overhead than a pointer swap to a cached color.
+    private static let partyL: CGFloat = 0.72
+    // 12 fps × 60 frames = 5 sec cycle. Runs as a CAKeyframeAnimation on a
+    // CALayer sublayer, so per-frame compositing happens in the render server
+    // — our process does no per-frame work. fps and frame count drive only
+    // the one-time CGImage rasterization cost (~10-20 ms), not runtime CPU.
+    private static let partyFPS: Double = 12
+    private static let partyFrames = 60
+
+    private static let partyColors: [NSColor] = {
+        var out: [NSColor] = []
+        out.reserveCapacity(partyFrames)
+        for f in 0..<partyFrames {
+            let h = CGFloat(f) / CGFloat(partyFrames)
+            // OKLCh leg: binary-search max C in sRGB gamut at partyL.
+            var lo: CGFloat = 0, hi: CGFloat = 0.4
+            for _ in 0..<22 {
+                let mid = (lo + hi) / 2
+                if linearRGBInGamut(L: partyL, C: mid, h: h) { lo = mid }
+                else { hi = mid }
+            }
+            let (or, og, ob) = oklchToLinearRGB(L: partyL, C: lo * 0.98, h: h)
+            let osR = linearToSRGB(or), osG = linearToSRGB(og), osB = linearToSRGB(ob)
+            // HSB leg: s=v=1 simplifies HSV→RGB to lerps between primaries.
+            let (hR, hG, hB) = hsbToSRGB(h: h)
+            out.append(NSColor(srgbRed: (osR + hR) / 2,
+                               green:   (osG + hG) / 2,
+                               blue:    (osB + hB) / 2,
+                               alpha:   1))
         }
-        RunLoop.main.add(t, forMode: .common)
-        partyTimer = t
+        return out
+    }()
+
+    private static func partyColor(frame: Int) -> NSColor {
+        partyColors[frame % partyFrames]
     }
 
-    private func stopPartyTimer() {
-        partyTimer?.invalidate()
-        partyTimer = nil
-        refreshIcon()
+    private static func hsbToSRGB(h: CGFloat) -> (CGFloat, CGFloat, CGFloat) {
+        let scaled = h * 6
+        let i = Int(scaled.rounded(.down)) % 6
+        let f = scaled - floor(scaled)
+        switch i {
+        case 0: return (1, f, 0)
+        case 1: return (1 - f, 1, 0)
+        case 2: return (0, 1, f)
+        case 3: return (0, 1 - f, 1)
+        case 4: return (f, 0, 1)
+        default: return (1, 0, 1 - f)
+        }
+    }
+
+    // OKLab → linear sRGB (Björn Ottosson, https://bottosson.github.io/posts/oklab/)
+    private static func oklchToLinearRGB(L: CGFloat, C: CGFloat, h: CGFloat) -> (CGFloat, CGFloat, CGFloat) {
+        let hr = h * 2 * .pi
+        let a = C * cos(hr)
+        let b = C * sin(hr)
+        let l_ = L + 0.3963377774 * a + 0.2158037573 * b
+        let m_ = L - 0.1055613458 * a - 0.0638541728 * b
+        let s_ = L - 0.0894841775 * a - 1.2914855480 * b
+        let lc = l_ * l_ * l_, mc = m_ * m_ * m_, sc = s_ * s_ * s_
+        return (
+             4.0767416621 * lc - 3.3077115913 * mc + 0.2309699292 * sc,
+            -1.2684380046 * lc + 2.6097574011 * mc - 0.3413193965 * sc,
+            -0.0041960863 * lc - 0.7034186147 * mc + 1.7076147010 * sc
+        )
+    }
+
+    private static func linearRGBInGamut(L: CGFloat, C: CGFloat, h: CGFloat) -> Bool {
+        let (r, g, b) = oklchToLinearRGB(L: L, C: C, h: h)
+        return r >= 0 && r <= 1 && g >= 0 && g <= 1 && b >= 0 && b <= 1
+    }
+
+    private static func linearToSRGB(_ c: CGFloat) -> CGFloat {
+        let v = max(0, min(1, c))
+        return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1 / 2.4) - 0.055
+    }
+
+    /// Idempotent: if the animation is already running with the same cache
+    /// key, this is a no-op. Otherwise rebuilds the cache (only if key
+    /// changed), rasterizes each NSImage to a CGImage, and installs a
+    /// CAKeyframeAnimation on the sublayer's contents key path. Per-frame
+    /// compositing is then handled by the render server with no app CPU.
+    ///
+    /// button.image is set to a transparent placeholder of the correct size
+    /// so the variable-length status item still reserves the right width.
+    /// The sublayer overlays the (invisible) image area; the title is drawn
+    /// to the left and is unaffected.
+    private func ensurePartyAnimation() {
+        guard let layer = partyIconLayer, let button = statusItem.button else { return }
+        let key = PartyCacheKey(
+            pct: Int(lastBatteryPct.rounded()),
+            enableFill: settings.enableFill,
+            enableSmiley: settings.enableSmiley,
+            contrastySmiley: settings.contrastySmiley
+        )
+        if partyAnimationKey == key, layer.animation(forKey: "party") != nil { return }
+
+        if partyCache?.key != key {
+            partyCache = (key, buildPartyImageCache())
+        }
+        guard let nsImages = partyCache?.images, !nsImages.isEmpty else { return }
+        let cgImages = nsImages.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
+        guard cgImages.count == nsImages.count else { return }
+
+        button.image = NSImage(size: nsImages[0].size)
+        updatePartyLayerFrame()
+        layer.isHidden = false
+
+        let anim = CAKeyframeAnimation(keyPath: "contents")
+        anim.values = cgImages
+        anim.duration = Double(cgImages.count) / Self.partyFPS
+        anim.repeatCount = .infinity
+        anim.calculationMode = .discrete
+        layer.removeAnimation(forKey: "party")
+        layer.add(anim, forKey: "party")
+        partyAnimationKey = key
+    }
+
+    private func stopPartyAnimation() {
+        partyIconLayer?.removeAnimation(forKey: "party")
+        partyIconLayer?.isHidden = true
+        partyAnimationKey = nil
+    }
+
+    /// Aligns the party sublayer with the NSButtonCell's image rect so the
+    /// animated icon overlays exactly where button.image would have been
+    /// drawn. Called when the layer is shown and whenever the button's
+    /// width changes (e.g. percentage title flips digits).
+    private func updatePartyLayerFrame() {
+        guard let button = statusItem.button, let layer = partyIconLayer,
+              let cell = button.cell as? NSButtonCell else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.frame = cell.imageRect(forBounds: button.bounds)
+        CATransaction.commit()
     }
 
     /// Extracts the smiley-only pixels from the cropped icon.
@@ -419,8 +739,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Picks pure black or pure white based on perceived luminance of the fill
     /// color (Rec. 709 weights). Threshold 0.5 = above is "light" → black smiley.
-    private func contrastNSColor(for fill: Color) -> NSColor {
-        let ns = NSColor(fill).usingColorSpace(.sRGB) ?? .white
+    /// Takes NSColor (not SwiftUI Color) to avoid the bridging conversion on
+    /// the party hot path.
+    private func contrastNSColor(forNS fill: NSColor) -> NSColor {
+        let ns = fill.usingColorSpace(.sRGB) ?? .white
         let lum = 0.2126*ns.redComponent + 0.7152*ns.greenComponent + 0.0722*ns.blueComponent
         return lum > 0.5 ? .black : .white
     }
@@ -570,6 +892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let state: BatteryState = charging ? .charging : saverOn ? .saverOn : .saverOff
         lastBatteryPct = battPct
         lastBatteryState = state
+        syncPartyTimer()
         refreshIcon()
         history.append(percentage: battPct, state: state)
         if settings.autoBoost {
@@ -642,6 +965,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lastBatteryState = charging ? .charging : on ? .saverOn : .saverOff
                 self.history.append(percentage: self.lastBatteryPct, state: self.lastBatteryState)
                 self.updateMenuBarTitle(percentage: self.lastBatteryPct)
+                self.syncPartyTimer()
                 self.refreshIcon()
                 if self.settings.notificationsEnabled {
                     Notifier.shared.notifyToggle(saverOn: on)
@@ -658,10 +982,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applySaver(on)
     }
 
+    /// Single entrypoint for "re-check what state the app should be in now."
+    /// Triggered by performance/threshold setting changes and once 30 sec
+    /// after launch (settling pass for initial state).
+    ///
+    /// - If autoBoost is on: run the policy check and apply if it diverges.
+    /// - Always: repaint the icon. Threshold changes (e.g. saverOnAtBatt)
+    ///   affect the fill color decision in fillNSColorForBattery even when
+    ///   the saver itself doesn't flip.
+    private func reconcileBehavior() {
+        if settings.autoBoost { reconcileSaverState() }
+        refreshIcon()
+    }
+
     /// Compute the saver state that autoBoost would currently want, and apply it
-    /// if different from the live state. Called when autoBoost is re-enabled so
-    /// the policy kicks in immediately instead of waiting for the next state
-    /// transition (which might never come).
+    /// if different from the live state.
     private func reconcileSaverState() {
         guard !isApplyingChange else { return }
         let cpu = monitor.sampleCPU()

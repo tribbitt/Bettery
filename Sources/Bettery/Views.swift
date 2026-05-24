@@ -313,10 +313,17 @@ struct BatteryGraphView: View {
 
 struct OptionsView: View {
     @ObservedObject var settings: Settings
+    @ObservedObject var appState: AppState
 
     @State private var showThresholds = false
     @State private var showAppearance = false
+    @State private var appearanceTab: AppearanceTab = .graph
     @State private var launchAtLogin: Bool = (SMAppService.mainApp.status == .enabled)
+
+    private enum AppearanceTab: String, CaseIterable {
+        case graph = "Graph"
+        case fill = "Fill"
+    }
 
     private func setLaunchAtLogin(_ on: Bool) {
         do {
@@ -340,6 +347,7 @@ struct OptionsView: View {
 
             toggleRow(label: "Auto-Boost Performance", value: $settings.autoBoost)
                 .padding(.vertical, 4)
+            Divider()
             toggleRow(label: "Notifications", value: $settings.notificationsEnabled)
                 .padding(.bottom, 4)
 
@@ -347,14 +355,14 @@ struct OptionsView: View {
                 sectionHeader(label: "Toggle Thresholds", expanded: $showThresholds)
                 if showThresholds {
                     VStack(alignment: .leading, spacing: 0) {
-                        settingRow(label: "Saver Off at CPU",     value: $settings.saverOffAtCPU)
-                        settingRow(label: "Saver Off at GPU",     value: $settings.saverOffAtGPU)
-                        settingRow(label: "Saver On at CPU",      value: $settings.saverOnAtCPU)
-                        settingRow(label: "Saver On at GPU",      value: $settings.saverOnAtGPU)
+                        settingRow(label: "Low-Power Off at CPU", value: $settings.saverOffAtCPU)
+                        settingRow(label: "Low-Power Off at GPU", value: $settings.saverOffAtGPU)
+                        settingRow(label: "Low-Power On at CPU",  value: $settings.saverOnAtCPU)
+                        settingRow(label: "Low-Power On at GPU",  value: $settings.saverOnAtGPU)
                         Divider().padding(.vertical, 4)
-                        settingRow(label: "Saver On at Battery",  value: $settings.saverOnAtBatt)
+                        settingRow(label: "Low-Power On at Battery", value: $settings.saverOnAtBatt)
                         Divider().padding(.vertical, 4)
-                        toggleRow(label: "Saver On When Charging", value: $settings.saverOnWhileCharging)
+                        toggleRow(label: "Low-Power On When Charging", value: $settings.saverOnWhileCharging)
                     }
                     .padding(.leading, 10)
                     .padding(.bottom, 4)
@@ -366,22 +374,29 @@ struct OptionsView: View {
             sectionHeader(label: "Appearance", expanded: $showAppearance)
             if showAppearance {
                 VStack(alignment: .leading, spacing: 8) {
-                    groupLabel("Graph Colors")
-                    colorRow(label: "Charging",       binding: $settings.graphChargingColor)
-                    colorRow(label: "Normal",         binding: $settings.graphStandardColor)
-                    colorRow(label: "Low-Power Mode", binding: $settings.graphSaverColor)
-                    colorRow(label: "Sleep",          binding: $settings.graphSleepColor)
+                    Picker("", selection: $appearanceTab) {
+                        ForEach(AppearanceTab.allCases, id: \.self) { tab in
+                            Text(tab.rawValue).tag(tab)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
 
-                    groupLabel("Icon Fill")
-                        .padding(.top, 4)
-                    toggleRow(label: "Fill",          value: $settings.enableFill)
-                    if settings.enableFill {
-                        toggleRow(label: "Party Mode", value: $settings.partyMode)
-                        if !settings.partyMode {
-                            colorRow(label: "Charging",       binding: $settings.fillChargingColor)
-                            colorRow(label: "Normal",         binding: $settings.fillStandardColor)
-                            colorRow(label: "Low-Power Mode", binding: $settings.fillSaverColor)
-                            colorRow(label: "Low-Battery",    binding: $settings.fillLowBatteryColor)
+                    switch appearanceTab {
+                    case .graph:
+                        let clearSlot = { appState.activeFillSlot = nil }
+                        colorRow(label: "Charging",       binding: $settings.graphChargingColor, onActivate: clearSlot)
+                        colorRow(label: "Normal",         binding: $settings.graphStandardColor, onActivate: clearSlot)
+                        colorRow(label: "Low-Power Mode", binding: $settings.graphSaverColor,    onActivate: clearSlot)
+                        colorRow(label: "Sleep",          binding: $settings.graphSleepColor,    onActivate: clearSlot)
+                    case .fill:
+                        toggleRow(label: "Fill", value: $settings.enableFill)
+                        if settings.enableFill {
+                            ForEach(FillSlot.allCases, id: \.self) { slot in
+                                colorRow(label: slot.rawValue, binding: settings.fillColor(for: slot)) {
+                                    appState.activeFillSlot = slot
+                                }
+                            }
                         }
                     }
 
@@ -491,14 +506,16 @@ struct OptionsView: View {
             .textCase(.uppercase)
     }
 
-    private func colorRow(label: String, binding: Binding<Color>) -> some View {
+    /// Color picker row. `onActivate` fires the instant the swatch is
+    /// pressed, *before* NSColorPanel opens — used to set the active slot so
+    /// the panel's accessory view binds to the right Party Mode flag.
+    private func colorRow(label: String, binding: Binding<Color>, onActivate: @escaping () -> Void = {}) -> some View {
         HStack {
             Text(label)
                 .font(settings.font(size: 12))
                 .frame(maxWidth: .infinity, alignment: .leading)
-            ColorPicker("", selection: binding, supportsOpacity: false)
-                .labelsHidden()
-                .frame(width: 44)
+            ActivatingColorPicker(color: binding, onActivate: onActivate)
+                .frame(width: 44, height: 22)
         }
     }
 
@@ -664,13 +681,13 @@ struct MainMenuView: View {
             .buttonStyle(MenuRowButtonStyle())
 
             if showOptions {
-                OptionsView(settings: settings)
+                OptionsView(settings: settings, appState: state)
                 Divider()
             }
 
             Divider()
 
-            menuRow(label: "Battery Saver", verticalPadding: 7,
+            menuRow(label: "Low-Power Mode", verticalPadding: 7,
                     action: { onToggle(!state.saverOn) }) {
                 Toggle("", isOn: Binding(get: { state.saverOn },
                                          set: { onToggle($0) }))
@@ -692,7 +709,7 @@ struct MainMenuView: View {
         )
     }
 
-    /// Full-width tap-target row used for Battery Saver / Battery Settings /
+    /// Full-width tap-target row used for Low-Power Mode / Battery Settings /
     /// Quit. `trailing` defaults to nothing, so simple text-only rows don't
     /// need to specify it.
     private func menuRow<Trailing: View>(
@@ -735,6 +752,71 @@ struct MainMenuView: View {
 
 // MARK: - Native vibrancy background
 
+/// NSColorWell subclass that fires `onActivate` on `mouseDown` — runs
+/// *before* super, so by the time NSColorPanel.shared opens we've already
+/// set the active slot. SwiftUI's ColorPicker doesn't expose an open hook
+/// and `.simultaneousGesture` is swallowed by NSColorWell's own handling.
+final class ActivatingColorWell: NSColorWell {
+    var onActivate: (() -> Void)?
+    override func mouseDown(with event: NSEvent) {
+        onActivate?()
+        super.mouseDown(with: event)
+    }
+}
+
+struct ActivatingColorPicker: NSViewRepresentable {
+    @Binding var color: Color
+    var onActivate: () -> Void
+
+    func makeNSView(context: Context) -> ActivatingColorWell {
+        let well = ActivatingColorWell()
+        well.color = NSColor(color)
+        well.target = context.coordinator
+        well.action = #selector(Coordinator.colorChanged(_:))
+        well.onActivate = onActivate
+        return well
+    }
+    func updateNSView(_ nsView: ActivatingColorWell, context: Context) {
+        let ns = NSColor(color)
+        if nsView.color != ns { nsView.color = ns }
+        nsView.onActivate = onActivate
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(color: $color) }
+
+    final class Coordinator: NSObject {
+        @Binding var color: Color
+        init(color: Binding<Color>) { _color = color }
+        @objc func colorChanged(_ sender: NSColorWell) {
+            let new = Color(nsColor: sender.color)
+            // Cheap idempotency guard: if SwiftUI rebinds the same value mid-sync,
+            // assigning back triggers another updateNSView pass.
+            if NSColor(color) != sender.color { color = new }
+        }
+    }
+}
+
+/// Accessory strip mounted at the bottom of NSColorPanel — bound to the
+/// per-slot Party flag for the picker that's currently open. AppDelegate
+/// rebuilds the hosting view whenever appState.activeFillSlot changes.
+struct ColorPanelAccessory: View {
+    @ObservedObject var settings: Settings
+    let slot: FillSlot
+
+    var body: some View {
+        HStack {
+            Text("Party Mode – \(slot.rawValue)")
+                .font(settings.font(size: 12))
+            Spacer()
+            Toggle("", isOn: settings.partyFlag(for: slot))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+}
+
 struct VisualEffectBlur: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let v = NSVisualEffectView()
@@ -748,8 +830,21 @@ struct VisualEffectBlur: NSViewRepresentable {
 
 // MARK: - Shared app state
 
+/// Identifies which fill slot's color picker is currently open in the
+/// system NSColorPanel. Drives which Party Mode toggle the panel's
+/// accessory view binds to.
+enum FillSlot: String, CaseIterable {
+    case charging      = "Charging"
+    case standard      = "Normal"
+    case saver         = "Low-Power Mode"
+    case lowBattery    = "Low-Battery"
+}
+
 final class AppState: ObservableObject {
     @Published var saverOn: Bool = false
     @Published var powerSource: String = "—"
     @Published var significantApps: [EnergyApp] = []
+    // nil = no fill picker currently open; AppDelegate observes and updates
+    // NSColorPanel.shared.accessoryView accordingly.
+    @Published var activeFillSlot: FillSlot? = nil
 }
