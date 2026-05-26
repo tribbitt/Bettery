@@ -30,6 +30,21 @@ final class TopAnchoredPanel: NSPanel {
     // when the host window can't become main — so the swatch click appears
     // to do nothing. Returning YES restores the popup.
     override var canBecomeMain: Bool { true }
+
+    /// Skip Auto Layout's layout pass while the panel is offscreen. macOS's
+    /// NSDisplayCycle calls layoutIfNeeded on every CA transaction commit
+    /// regardless of window visibility, and that pulls the entire SwiftUI
+    /// render pipeline (ViewGraph.updateOutputs → body re-evals → XPC calls
+    /// in @State initializers) into the hot path. Profiled at ~2% CPU
+    /// sustained with the panel "closed" but the NSHostingView still
+    /// attached. Returning early when !isVisible drops it to ~0.
+    /// Explicit calls in showPanel use `view.layoutSubtreeIfNeeded()` on
+    /// the contentViewController's view directly, which doesn't go through
+    /// this method, so the size-on-open path still works.
+    override func layoutIfNeeded() {
+        guard isVisible else { return }
+        super.layoutIfNeeded()
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -59,19 +74,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastBatteryPct: Double = 100
     private var lastBatteryState: BatteryState = .saverOff
 
-    /// One decoded PNG with its smiley-pixels mask pre-extracted and a
-    /// matching outline (smiley pixels punched out). pxToPt is the per-asset
+    /// One decoded PNG with its smiley-pixels mask pre-extracted, a matching
+    /// outline (smiley pixels punched out), and a parallel set of solid-black
+    /// variants used when "Dark Icon" is on. pxToPt is the per-asset
     /// point-per-pixel scale so renderSize stays consistent across assets.
     private struct IconAsset {
         let croppedCG: CGImage
         let smileyCG: CGImage?
         let outlineCG: CGImage?
+        let darkCroppedCG: CGImage?
+        let darkSmileyCG: CGImage?
+        let darkOutlineCG: CGImage?
         let pxToPt: CGFloat
     }
 
-    // Lazily decode each PNG once and pre-compute the smiley-only mask used
-    // when "Dark Smiley" is enabled. trimTransparentEdges + the exterior
-    // flood-fill are O(W*H) and shouldn't run on every redraw.
+    // Lazily decode each PNG once and pre-compute the smiley-only mask plus
+    // the solid-black "Dark Icon" variants. trimTransparentEdges + the
+    // exterior flood-fill + the dark-tint pass are all O(W*H) and shouldn't
+    // run on every redraw — once Dark Icon is toggled, composedIcon just
+    // picks the pre-rasterized dark CGImages with zero per-frame work.
     private lazy var smileyAsset: IconAsset? = loadIconAsset(named: "betterywhiteicon")
     private lazy var frownAsset: IconAsset? = loadIconAsset(named: "betterywhitefrownicon")
 
@@ -96,7 +117,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ctx.draw(smiley, in: CGRect(x: 0, y: 0, width: w, height: h))
             return ctx.makeImage()
         }
-        return IconAsset(croppedCG: croppedCG, smileyCG: smileyCG, outlineCG: outlineCG, pxToPt: pxToPt)
+        return IconAsset(
+            croppedCG: croppedCG,
+            smileyCG: smileyCG,
+            outlineCG: outlineCG,
+            darkCroppedCG: Self.tintBlack(croppedCG),
+            darkSmileyCG:  smileyCG.flatMap { Self.tintBlack($0) },
+            darkOutlineCG: outlineCG.flatMap { Self.tintBlack($0) },
+            pxToPt: pxToPt
+        )
+    }
+
+    /// Repaints every non-transparent pixel of `src` as solid black, alpha
+    /// preserved (so anti-aliased edges stay smooth). Done once per asset at
+    /// load time and stored in IconAsset — composedIcon then draws the
+    /// returned CGImage straight, no per-frame tinting.
+    private static func tintBlack(_ src: CGImage) -> CGImage? {
+        let w = src.width, h = src.height
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        let rect = CGRect(x: 0, y: 0, width: w, height: h)
+        ctx.draw(src, in: rect)
+        ctx.setBlendMode(.sourceIn)
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        ctx.fill(rect)
+        return ctx.makeImage()
     }
 
     // Party mode rainbow cycle. We hand the rasterized frames to a
@@ -119,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pct: Int                // rounded — sub-int fill-width is invisible
         let enableFill: Bool
         let enableSmiley: Bool
-        let contrastySmiley: Bool
+        let darkIcon: Bool
         // True when composedIcon would pick the frown asset for the current
         // slot. Crossing the low-battery boundary doesn't always change pct
         // (e.g., plugging in at exactly the threshold), so without this flag
@@ -307,19 +355,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings.$fillStandardColor.voidChanges(),
             settings.$fillSaverColor.voidChanges(),
             settings.$fillLowBatteryColor.voidChanges(),
-            settings.$contrastySmiley.voidChanges(),
+            settings.$darkIcon.voidChanges(),
             settings.$enableFill.voidChanges(),
             settings.$enableSmiley.voidChanges(),
         ])
         .sink { [weak self] in self?.refreshIcon() }
         .store(in: &cancellables)
 
-        settings.$showPercentage.dropFirst()
-            .sink { [weak self] _ in
-                guard let self else { return }
-                self.updateMenuBarTitle(percentage: self.lastBatteryPct)
-            }
-            .store(in: &cancellables)
+        // showPercentage changes the title's content; darkIcon changes its
+        // color. Both restyle through updateMenuBarTitle. voidChanges already
+        // drops the initial @Published emission so this won't fire on launch.
+        Publishers.MergeMany([
+            settings.$showPercentage.voidChanges(),
+            settings.$darkIcon.voidChanges(),
+        ])
+        .sink { [weak self] in
+            guard let self else { return }
+            self.updateMenuBarTitle(percentage: self.lastBatteryPct)
+        }
+        .store(in: &cancellables)
 
         // Reset edge-detection state when autoBoost re-enables so the first
         // post-enable tick doesn't fire a spurious edge against stale prevs.
@@ -417,8 +471,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // Cached (title, darkIcon) tuple so we can early-return when the tick
+    // produces no actual change. Without this, assigning attributedTitle every
+    // 5 sec triggers a re-style / re-layout pass even when nothing differs,
+    // and (unlike .title) macOS doesn't dedupe identical attributed values.
+    private var lastAppliedTitle: String?
+    private var lastAppliedDark: Bool?
+
     /// Updates the menu bar label to the current battery percentage. Called from
-    /// the 5-sec tick — cheap, just an NSButton title swap.
+    /// the 5-sec tick — cheap, just an NSButton title swap. When Dark Icon is
+    /// on the title is forced to black via attributedTitle; otherwise we set
+    /// plain `.title` so macOS picks the auto menubar color (dark/light aware).
     private func updateMenuBarTitle(percentage: Double) {
         let newTitle: String
         if settings.showPercentage {
@@ -427,11 +490,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             newTitle = ""
         }
-        guard statusItem.button?.title != newTitle else { return }
-        statusItem.button?.title = newTitle
+        guard let button = statusItem.button else { return }
+
+        let dark = settings.darkIcon
+        if lastAppliedTitle == newTitle, lastAppliedDark == dark { return }
+
+        let widthChanged = lastAppliedTitle != newTitle
+        if dark {
+            button.attributedTitle = NSAttributedString(
+                string: newTitle,
+                attributes: [
+                    .foregroundColor: NSColor.black,
+                    .font: NSFont.menuBarFont(ofSize: 0)
+                ]
+            )
+        } else {
+            // Assigning .title clears any previously-set attributedTitle so
+            // toggling Dark Icon off restores the system auto-color.
+            button.title = newTitle
+        }
+        lastAppliedTitle = newTitle
+        lastAppliedDark = dark
+
         // Title-width change shifts the cell's imageRect, so the party
         // sublayer needs to re-align. Async so the button has laid out.
-        if partyAnimationKey != nil {
+        if widthChanged, partyAnimationKey != nil {
             DispatchQueue.main.async { [weak self] in self?.updatePartyLayerFrame() }
         }
     }
@@ -581,33 +664,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // When smiley is enabled: draw full PNG at 75% then repaint smiley at
             // 100% for crispness. When disabled: draw outlineCG (smiley pixels
             // pre-erased via destinationOut) at full opacity so dots don't bleed.
+            // Dark Icon swaps in the pre-rasterized black variants — no
+            // per-frame tinting required.
+            let darkOn = self.settings.darkIcon
             if self.settings.enableSmiley && assets.smileyCG != nil {
-                NSImage(cgImage: assets.croppedCG, size: rect.size)
+                let bg = darkOn ? (assets.darkCroppedCG ?? assets.croppedCG) : assets.croppedCG
+                NSImage(cgImage: bg, size: rect.size)
                     .draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.75)
             } else {
-                let src = assets.outlineCG ?? assets.croppedCG
+                let src: CGImage
+                if darkOn {
+                    src = assets.darkOutlineCG ?? assets.darkCroppedCG ?? assets.outlineCG ?? assets.croppedCG
+                } else {
+                    src = assets.outlineCG ?? assets.croppedCG
+                }
                 NSImage(cgImage: src, size: rect.size)
                     .draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
             }
 
-            if self.settings.enableSmiley, let smiley = assets.smileyCG {
-                // Party + Fill off: paint the smiley with the cycling hue so
-                // Party Mode has a visible surface even without the fill rect.
-                let smileyColor: NSColor
-                if self.isPartyState(percentage: percentage, state: state) && !self.settings.enableFill {
-                    smileyColor = fillColor
-                } else if self.settings.contrastySmiley {
-                    smileyColor = self.contrastNSColor(forNS: fillColor)
-                } else {
-                    smileyColor = .white
+            if self.settings.enableSmiley {
+                // Party + Fill off is the only path that still needs a runtime
+                // tint — the smiley adopts the cycling hue so Party Mode has a
+                // visible surface without the fill rect. Dark Icon overrides
+                // party here so the icon stays uniformly black.
+                let partyTint = !darkOn
+                    && self.isPartyState(percentage: percentage, state: state)
+                    && !self.settings.enableFill
+                if partyTint, let smiley = assets.smileyCG {
+                    let tinted = NSImage(size: rect.size, flipped: false) { drawRect in
+                        NSImage(cgImage: smiley, size: drawRect.size).draw(in: drawRect)
+                        fillColor.set()
+                        drawRect.fill(using: .sourceIn)
+                        return true
+                    }
+                    tinted.draw(in: rect)
+                } else if let smiley = (darkOn ? assets.darkSmileyCG : assets.smileyCG) ?? assets.smileyCG {
+                    NSImage(cgImage: smiley, size: rect.size).draw(in: rect)
                 }
-                let tinted = NSImage(size: rect.size, flipped: false) { drawRect in
-                    NSImage(cgImage: smiley, size: drawRect.size).draw(in: drawRect)
-                    smileyColor.set()
-                    drawRect.fill(using: .sourceIn)
-                    return true
-                }
-                tinted.draw(in: rect)
             }
             return true
         }
@@ -771,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pct: Int(lastBatteryPct.rounded()),
             enableFill: settings.enableFill,
             enableSmiley: settings.enableSmiley,
-            contrastySmiley: settings.contrastySmiley,
+            darkIcon: settings.darkIcon,
             useFrown: fillSlot(percentage: lastBatteryPct, state: lastBatteryState) == .lowBattery
         )
         if partyAnimationKey == key, layer.animation(forKey: "party") != nil { return }
@@ -902,16 +995,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         return outCtx.makeImage()
-    }
-
-    /// Picks pure black or pure white based on perceived luminance of the fill
-    /// color (Rec. 709 weights). Threshold 0.5 = above is "light" → black smiley.
-    /// Takes NSColor (not SwiftUI Color) to avoid the bridging conversion on
-    /// the party hot path.
-    private func contrastNSColor(forNS fill: NSColor) -> NSColor {
-        let ns = fill.usingColorSpace(.sRGB) ?? .white
-        let lum = 0.2126*ns.redComponent + 0.7152*ns.greenComponent + 0.0722*ns.blueComponent
-        return lum > 0.5 ? .black : .white
     }
 
     /// Returns a CGImage cropped to the bounding box of non-transparent pixels.

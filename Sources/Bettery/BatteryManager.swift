@@ -53,16 +53,11 @@ final class BatteryManager {
     }
 
     /// Returns whether low power mode is enabled for the current power source.
+    /// Direct property read — no subprocess. The previous implementation forked
+    /// `pmset -g` and parsed its output every 5-sec tick, which alone burned
+    /// ~1.7% of CPU sustained (~50ms of fork+exec+pipe per tick).
     func isLowPowerModeEnabled() -> Bool {
-        let output = runPmset(args: ["-g"])
-        guard let output else { return false }
-        for line in output.split(separator: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("lowpowermode") {
-                return trimmed.hasSuffix("1")
-            }
-        }
-        return false
+        ProcessInfo.processInfo.isLowPowerModeEnabled
     }
 
     static let sudoersFilePath = "/etc/sudoers.d/bettery-pmset"

@@ -25,7 +25,7 @@ final class Settings: ObservableObject {
         static let fillSaver = "fillSaverColorData"
         static let fillLowBatt = "fillLowBatteryColorData"
         static let fontFamily = "fontFamily"
-        static let contrastySmiley = "contrastySmiley"
+        static let darkIcon = "darkIcon"
         static let enableFill = "enableFill"
         static let enableSmiley = "enableSmiley"
         static let autoBoost = "autoBoost"
@@ -52,7 +52,7 @@ final class Settings: ObservableObject {
     static let defaultBattOn: Double = 25
     static let defaultSaverWhileCharging: Bool = false
     static let defaultFontFamily: String = "system"
-    static let defaultContrastySmiley: Bool = false
+    static let defaultDarkIcon: Bool = false
     static let defaultEnableFill: Bool = true
     static let defaultEnableSmiley: Bool = true
     static let defaultAutoBoost: Bool = true
@@ -123,7 +123,7 @@ final class Settings: ObservableObject {
     @Published var fillSaverColor: Color      { didSet { defaults.set(Self.encode(fillSaverColor),      forKey: Keys.fillSaver) } }
     @Published var fillLowBatteryColor: Color { didSet { defaults.set(Self.encode(fillLowBatteryColor), forKey: Keys.fillLowBatt) } }
     @Published var fontFamily: String         { didSet { defaults.set(fontFamily, forKey: Keys.fontFamily) } }
-    @Published var contrastySmiley: Bool      { didSet { defaults.set(contrastySmiley, forKey: Keys.contrastySmiley) } }
+    @Published var darkIcon: Bool             { didSet { defaults.set(darkIcon, forKey: Keys.darkIcon) } }
     @Published var enableFill: Bool           { didSet { defaults.set(enableFill, forKey: Keys.enableFill) } }
     @Published var enableSmiley: Bool         { didSet { defaults.set(enableSmiley,     forKey: Keys.enableSmiley) } }
     @Published var autoBoost: Bool             { didSet { defaults.set(autoBoost,             forKey: Keys.autoBoost) } }
@@ -148,7 +148,7 @@ final class Settings: ObservableObject {
             Keys.saverWhileCharging: Self.defaultSaverWhileCharging,
             Keys.iconStyle: "black",
             Keys.fontFamily: Self.defaultFontFamily,
-            Keys.contrastySmiley: Self.defaultContrastySmiley,
+            Keys.darkIcon: Self.defaultDarkIcon,
             Keys.enableFill: Self.defaultEnableFill,
             Keys.enableSmiley:    Self.defaultEnableSmiley,
             Keys.autoBoost:             Self.defaultAutoBoost,
@@ -176,7 +176,7 @@ final class Settings: ObservableObject {
         self.fillStandardColor    = Self.decode(defaults.data(forKey: Keys.fillStandard),  fallback: Self.defaultFillStandard)
         self.fillSaverColor       = Self.decode(defaults.data(forKey: Keys.fillSaver),     fallback: Self.defaultFillSaver)
         self.fillLowBatteryColor  = Self.decode(defaults.data(forKey: Keys.fillLowBatt),   fallback: Self.defaultFillLowBattery)
-        self.contrastySmiley      = defaults.bool(forKey: Keys.contrastySmiley)
+        self.darkIcon             = defaults.bool(forKey: Keys.darkIcon)
         self.enableFill           = defaults.bool(forKey: Keys.enableFill)
         self.enableSmiley         = defaults.bool(forKey: Keys.enableSmiley)
         self.autoBoost            = defaults.bool(forKey: Keys.autoBoost)
@@ -205,7 +205,7 @@ final class Settings: ObservableObject {
         fillSaverParty      = Self.defaultFillParty
         fillLowBatteryParty = Self.defaultFillParty
         fontFamily          = Self.defaultFontFamily
-        contrastySmiley     = Self.defaultContrastySmiley
+        darkIcon            = Self.defaultDarkIcon
         enableFill          = Self.defaultEnableFill
     }
 

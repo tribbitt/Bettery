@@ -9,20 +9,73 @@ import ServiceManagement
 // state are merged into a single Path so each color region is one draw call
 // and color transitions land precisely at the sample where the mode changed.
 
+// segments() walks ~17k samples + builds Paths + scans sleep intervals — fine
+// once per data tick, expensive at SwiftUI's render-cycle rate (any unrelated
+// setting toggle invalidates the body, which used to drag segments along too).
+// Cache by the actual inputs the output depends on; everything else (autoBoost,
+// fillColors, smiley flags, etc.) re-renders the graph but reuses cached segs.
+private final class SegmentCache {
+    struct Key: Equatable {
+        let samplesCount: Int
+        let lastSampleEpoch: TimeInterval?
+        let sleepCount: Int
+        let width: CGFloat
+        let height: CGFloat
+        let nowEpoch: TimeInterval
+        let stdColor: Color
+        let chgColor: Color
+        let svrColor: Color
+    }
+    private var lastKey: Key?
+    private var lastValue: [BatteryGraphView.Segment]?
+
+    func get(_ key: Key, _ compute: () -> [BatteryGraphView.Segment]) -> [BatteryGraphView.Segment] {
+        if lastKey == key, let lastValue { return lastValue }
+        let value = compute()
+        lastKey = key
+        lastValue = value
+        return value
+    }
+}
+
 struct BatteryGraphView: View {
     @ObservedObject var history: BatteryHistory
     @ObservedObject var settings: Settings
 
+    // Stable across body re-evals — @State holds the same class instance for
+    // the lifetime of the view identity. Hidden from SwiftUI's diffing.
+    @State private var segCache = SegmentCache()
+
     private let windowDuration: TimeInterval = 24 * 3600   // 24-hour sliding window
 
     var body: some View {
-        let now         = Date()
+        // `now` is pinned to the latest sample's timestamp (not `Date()`) so
+        // body's captured inputs only change when a new sample arrives — once
+        // per 5-sec tick instead of on every CA transaction. Without this,
+        // Party Mode's CAKeyframeAnimation drives SwiftUI's runloop observer
+        // at ~60Hz, body re-evaluates 60×/sec, `Date()` returns a new value
+        // each time, and segments()/Canvas/Path rebuilds storm the CPU
+        // (measured 4% sustained, vs ~0.8% with this pin in place).
+        // 5-sec lag on a 24h x-axis is sub-pixel — invisible.
+        let now         = history.samples.last?.timestamp ?? Date()
         let windowStart = now.addingTimeInterval(-windowDuration)
 
         return VStack(alignment: .leading, spacing: 4) {
             GeometryReader { geo in
-                let segs = segments(width: geo.size.width, height: geo.size.height,
-                                    windowStart: windowStart, now: now)
+                let segs = segCache.get(SegmentCache.Key(
+                    samplesCount: history.samples.count,
+                    lastSampleEpoch: history.samples.last?.timestamp.timeIntervalSince1970,
+                    sleepCount: history.sleepIntervals.count,
+                    width: geo.size.width,
+                    height: geo.size.height,
+                    nowEpoch: now.timeIntervalSince1970,
+                    stdColor: settings.graphStandardColor,
+                    chgColor: settings.graphChargingColor,
+                    svrColor: settings.graphSaverColor
+                )) {
+                    segments(width: geo.size.width, height: geo.size.height,
+                             windowStart: windowStart, now: now)
+                }
                 ZStack(alignment: .bottom) {
                     // Horizontal grid at 25 / 50 / 75 %
                     ForEach([0.25, 0.50, 0.75], id: \.self) { frac in
@@ -92,7 +145,7 @@ struct BatteryGraphView: View {
 
     // MARK: - Segment computation
 
-    private struct Segment {
+    fileprivate struct Segment {
         let color: Color
         let crosshatched: Bool      // true when ≥1 endpoint is a pmset event (macOS history)
         let isSleep: Bool           // true when the segment's midpoint falls inside a sleep interval
@@ -320,7 +373,12 @@ struct OptionsView: View {
     @State private var showThresholds = false
     @State private var showAppearance = false
     @State private var appearanceTab: AppearanceTab = .graph
-    @State private var launchAtLogin: Bool = (SMAppService.mainApp.status == .enabled)
+    // Initial value is a placeholder — the real status is loaded in .onAppear.
+    // The previous form (`= SMAppService.mainApp.status == .enabled`) fired an
+    // XPC call (smd → mach_msg) on every OptionsView struct init, which SwiftUI
+    // does on every body re-eval — measured ~0.4% CPU sustained while the
+    // panel was visible (8 of 142 active samples in profiling).
+    @State private var launchAtLogin: Bool = false
 
     private enum AppearanceTab: String, CaseIterable {
         case graph = "Graph"
@@ -406,12 +464,16 @@ struct OptionsView: View {
                         }
                     }
 
-                    fontRow().padding(.top, 4)
+                    FontPickerRow(
+                        currentFont: settings.fontFamily,
+                        labelFont: settings.font(size: 12),
+                        onSelect: { settings.fontFamily = $0 }
+                    )
+                    .equatable()
+                    .padding(.top, 4)
                     toggleRow(label: "Battery Percentage", value: $settings.showPercentage)
                     toggleRow(label: "Smiley",             value: $settings.enableSmiley)
-                    if settings.enableSmiley {
-                        toggleRow(label: "Dark Smiley", value: $settings.contrastySmiley)
-                    }
+                    toggleRow(label: "Dark Icon",          value: $settings.darkIcon)
                     toggleRow(label: "Warning Blink at Low Battery", value: $settings.warningBlinkEnabled)
                     Button("Restore Default Colors") {
                         settings.restoreDefaultColors()
@@ -457,6 +519,8 @@ struct OptionsView: View {
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
+        // One XPC call on appear, not one per body re-eval.
+        .onAppear { launchAtLogin = (SMAppService.mainApp.status == .enabled) }
     }
 
     /// Banner shown beneath the Notifications toggle when macOS has blocked
@@ -563,18 +627,44 @@ struct OptionsView: View {
         }
     }
 
-    // Cached once — enumerating installed fonts isn't free, and the list is
-    // stable for the app's lifetime. Sorted for stable picker order.
+}
+
+/// Extracted from OptionsView so SwiftUI's `.equatable()` modifier can skip
+/// rebuilding the ~400-item ForEach when only the selection matters. Without
+/// this, every unrelated Settings toggle (autoBoost, fillColor, etc.)
+/// invalidated OptionsView's body, which rebuilt the entire Picker —
+/// iterating every installed font family on each render (~10 samples per
+/// 5-sec window in profiling). With Equatable conformance on `currentFont`,
+/// SwiftUI reuses the prior body output whenever the user's font choice
+/// hasn't changed.
+struct FontPickerRow: View, Equatable {
+    let currentFont: String
+    let labelFont: Font
+    let onSelect: (String) -> Void
+
+    // Cached once for the app lifetime — enumerating installed fonts isn't
+    // free, and the list is stable. Sorted for stable picker order.
     private static let installedFontFamilies: [String] = NSFontManager.shared
         .availableFontFamilies
         .sorted()
 
-    private func fontRow() -> some View {
+    static func == (lhs: FontPickerRow, rhs: FontPickerRow) -> Bool {
+        // Only the selection drives a re-render. labelFont is a pure function
+        // of fontFamily (Settings.font(size:weight:) dispatches only on
+        // fontFamily), so currentFont changing implies labelFont changing —
+        // no need to compare labelFont separately. Closures aren't compared.
+        lhs.currentFont == rhs.currentFont
+    }
+
+    var body: some View {
         HStack {
             Text("Font")
-                .font(settings.font(size: 12))
+                .font(labelFont)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Picker("", selection: $settings.fontFamily) {
+            Picker("", selection: Binding(
+                get: { currentFont },
+                set: { onSelect($0) }
+            )) {
                 Text("System").tag("system")
                 Text("Rounded").tag("rounded")
                 Text("Monospaced").tag("monospaced")
