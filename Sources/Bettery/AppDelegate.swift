@@ -59,11 +59,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastBatteryPct: Double = 100
     private var lastBatteryState: BatteryState = .saverOff
 
-    // Lazily decode the PNG once and pre-compute the smiley-only mask used
-    // when "Contrasty Smiley" is enabled. trimTransparentEdges + the
-    // exterior flood-fill are O(W*H) and shouldn't run on every redraw.
-    private lazy var iconAssets: (croppedCG: CGImage, smileyCG: CGImage?, outlineCG: CGImage?, pxToPt: CGFloat)? = {
-        guard let url = Bundle.module.url(forResource: "betterywhiteicon", withExtension: "png"),
+    /// One decoded PNG with its smiley-pixels mask pre-extracted and a
+    /// matching outline (smiley pixels punched out). pxToPt is the per-asset
+    /// point-per-pixel scale so renderSize stays consistent across assets.
+    private struct IconAsset {
+        let croppedCG: CGImage
+        let smileyCG: CGImage?
+        let outlineCG: CGImage?
+        let pxToPt: CGFloat
+    }
+
+    // Lazily decode each PNG once and pre-compute the smiley-only mask used
+    // when "Dark Smiley" is enabled. trimTransparentEdges + the exterior
+    // flood-fill are O(W*H) and shouldn't run on every redraw.
+    private lazy var smileyAsset: IconAsset? = loadIconAsset(named: "betterywhiteicon")
+    private lazy var frownAsset: IconAsset? = loadIconAsset(named: "betterywhitefrownicon")
+
+    private func loadIconAsset(named name: String) -> IconAsset? {
+        guard let url = Bundle.module.url(forResource: name, withExtension: "png"),
               let original = NSImage(contentsOf: url),
               let originalCG = original.cgImage(forProposedRect: nil, context: nil, hints: nil),
               let croppedCG = trimTransparentEdges(originalCG) else { return nil }
@@ -83,8 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ctx.draw(smiley, in: CGRect(x: 0, y: 0, width: w, height: h))
             return ctx.makeImage()
         }
-        return (croppedCG, smileyCG, outlineCG, pxToPt)
-    }()
+        return IconAsset(croppedCG: croppedCG, smileyCG: smileyCG, outlineCG: outlineCG, pxToPt: pxToPt)
+    }
 
     // Party mode rainbow cycle. We hand the rasterized frames to a
     // CAKeyframeAnimation on a CALayer sublayer of the menu-bar button —
@@ -107,6 +120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let enableFill: Bool
         let enableSmiley: Bool
         let contrastySmiley: Bool
+        // True when composedIcon would pick the frown asset for the current
+        // slot. Crossing the low-battery boundary doesn't always change pct
+        // (e.g., plugging in at exactly the threshold), so without this flag
+        // the cached frames could keep rendering the wrong icon body.
+        let useFrown: Bool
     }
     private var partyCache: (key: PartyCacheKey, images: [NSImage])?
 
@@ -117,15 +135,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var prevBattHealthy: Bool? = nil
     private var prevCharging: Bool? = nil
 
+    // Tracks the last computed fill slot so we can fire the warning blink
+    // only on the transition INTO low-battery (not every tick while there).
+    private var prevFillSlot: FillSlot?
+
+    // Warning-blink state. blinkTimer drives the phase advance; while it's
+    // non-nil, refreshIcon and syncPartyTimer short-circuit so the 5-sec
+    // sampling tick can't stomp on a blink frame. 6 phases × 500ms = 3 sec;
+    // even phases = full-fill warning frame, odd = empty (outline only).
+    private var blinkTimer: Timer?
+    private var blinkPhase: Int = 0
+    private static let blinkPhases: Int = 6
+    private static let blinkPhaseInterval: TimeInterval = 0.5
+
+    // Asymmetric debounce for the load-just-dropped → re-engage-LPM transition.
+    // Power-boost (LPM off) on high load fires immediately because the user
+    // needs performance now; re-engaging LPM waits for `lowLoadReadingsRequired`
+    // consecutive low-load ticks so brief dips between sustained bursts (build
+    // → edit → build, render → scrub → render) don't keep flipping LPM.
+    //
+    // 2 ticks × 5 sec/tick = 10 sec of confirmed low load. Note: CPU readings
+    // are already 5-sec averages (host_statistics cumulative-tick deltas), so
+    // 2 ticks ≈ 15 sec of effective averaging on CPU. GPU is instantaneous
+    // (IOAccelerator snapshot), so 2 ticks = exactly 2 snapshots spaced 5 sec
+    // apart — less smoothing on the GPU side.
+    private var lowLoadStreak: Int = 0
+    private static let lowLoadReadingsRequired: Int = 2
+
+    // Fluctuation detector: timestamps of auto-induced saver toggles within
+    // the trailing fluctuationWindow. When the count crosses the threshold we
+    // notify the user the policy is flapping — once per wake cycle, reset on
+    // NSWorkspace.didWakeNotification so they get a fresh warning if it
+    // recurs after waking from sleep.
+    private var autoToggleTimes: [Date] = []
+    private var hasNotifiedFluctuation: Bool = false
+    private static let fluctuationWindow: TimeInterval = 300  // 5 min
+    private static let fluctuationThreshold: Int = 4
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         Notifier.shared.requestAuthorization()
-        appState.saverOn = battery.isLowPowerModeEnabled()
+
+        // Prime lastBatteryPct/State from the live system BEFORE setupStatusItem
+        // calls refreshIcon — otherwise the first paint uses the property
+        // defaults (pct=100, state=.saverOff) and flashes a 100% standard
+        // smiley for a few ms before the first tick swaps in the real reading.
+        let pct = battery.batteryPercentage() ?? 100
+        let charging = battery.isCharging()
+        let saverOn = battery.isLowPowerModeEnabled()
+        lastBatteryPct = pct
+        lastBatteryState = charging ? .charging : saverOn ? .saverOn : .saverOff
+        appState.saverOn = saverOn
+
         setupStatusItem()
         setupPanel()
         setupColorPanelAccessory()
         history.loadHistorical()
         observeWake()
         startLoop()
+        refreshNotificationAuthStatus()
         // Settling reconcile 30 sec in: gives IOKit power-source readings and
         // the first CPU/GPU samples time to stabilize before we apply policy.
         // Catches cases where launch happened mid-transition (e.g. just woke
@@ -157,6 +224,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            // New wake cycle: re-arm the fluctuation notification so the user
+            // gets warned again if flapping resumes after sleep.
+            self?.hasNotifiedFluctuation = false
+            // Refresh battery state immediately rather than waiting up to 5
+            // sec for the sampling timer's next firing — otherwise the icon
+            // can show a stale frown/smiley right after wake if the battery
+            // state changed during sleep.
+            self?.tick()
+            // User may have changed notification permission via System
+            // Settings during sleep — re-query so the banner state is fresh.
+            self?.refreshNotificationAuthStatus()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                 self?.history.loadHistorical()
             }
@@ -245,12 +323,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Reset edge-detection state when autoBoost re-enables so the first
         // post-enable tick doesn't fire a spurious edge against stale prevs.
+        // Streak also resets so any pre-disable partial debounce doesn't carry over.
         settings.$autoBoost.dropFirst()
             .filter { $0 }
             .sink { [weak self] _ in
                 self?.prevHighLoad = nil
                 self?.prevBattHealthy = nil
                 self?.prevCharging = nil
+                self?.lowLoadStreak = 0
             }
             .store(in: &cancellables)
 
@@ -258,6 +338,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // setting changes. reconcileBehavior() applies the autoBoost policy
         // immediately and resyncs the fill color — e.g. raising saverOnAtBatt
         // above the current % should flip the icon to low-battery red now.
+        //
+        // Debounced (400 ms) because TextField/slider edits emit one value
+        // per intermediate value as the user types or drags. Without this,
+        // dragging "Low-Power Off at CPU" from 50→90 would fire up to 40
+        // pmset attempts in a fraction of a second; with it, one reconcile
+        // 400 ms after the user settles. Discrete toggles (autoBoost,
+        // saverOnWhileCharging) just take 400 ms to land — imperceptible.
         Publishers.MergeMany([
             settings.$autoBoost.voidChanges(),
             settings.$saverOnWhileCharging.voidChanges(),
@@ -267,8 +354,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings.$saverOffAtGPU.voidChanges(),
             settings.$saverOnAtBatt.voidChanges(),
         ])
+        .debounce(for: .milliseconds(400), scheduler: RunLoop.main)
         .sink { [weak self] in self?.reconcileBehavior() }
         .store(in: &cancellables)
+
+        // Re-check macOS notification permission when the user toggles the
+        // Bettery notifications setting on — covers the case where they
+        // disabled then re-enabled via System Settings, or first-time enable
+        // after the OS prompt was declined.
+        settings.$notificationsEnabled.dropFirst()
+            .filter { $0 }
+            .sink { [weak self] _ in self?.refreshNotificationAuthStatus() }
+            .store(in: &cancellables)
 
         // Start/stop the rainbow ticker on any per-state Party flag change.
         // syncPartyTimer also picks the right action based on the *current*
@@ -343,8 +440,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// In party mode this hands the rasterized frames to Core Animation as
     /// a CAKeyframeAnimation on a sublayer's contents — per-frame compositing
     /// runs in the render server, so our process does essentially no work
-    /// while party is active.
+    /// while party is active. While a warning blink is in progress, the
+    /// blink owns the icon — refreshIcon no-ops so the 5-sec sampling tick
+    /// can't clobber a blink frame mid-flash.
     private func refreshIcon() {
+        if blinkTimer != nil { return }
         guard let button = statusItem.button else { return }
         if currentStateIsParty && !screenAsleep {
             ensurePartyAnimation()
@@ -353,6 +453,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             partyCache = nil
             button.image = composedIcon(percentage: lastBatteryPct, state: lastBatteryState)
         }
+    }
+
+    /// Kicks off the 3-second warning-blink sequence. Stops any active party
+    /// animation so the button.image blink frames are visible (party resumes
+    /// in refreshIcon at the end). Idempotent: a second trigger during an
+    /// active blink is ignored.
+    private func triggerLowBatteryBlink() {
+        guard blinkTimer == nil else { return }
+        blinkPhase = 0
+        stopPartyAnimation()
+        renderBlinkFrame()
+        blinkPhase = 1
+        let timer = Timer.scheduledTimer(withTimeInterval: Self.blinkPhaseInterval, repeats: true) { [weak self] _ in
+            self?.advanceBlink()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        blinkTimer = timer
+    }
+
+    private func advanceBlink() {
+        if blinkPhase >= Self.blinkPhases {
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            blinkPhase = 0
+            refreshIcon()       // restores normal icon (and re-engages party if applicable)
+            return
+        }
+        renderBlinkFrame()
+        blinkPhase += 1
+    }
+
+    /// Even phase = full-fill warning frame; odd = empty (outline only).
+    /// Uses the lastBattery* cache so it stays in sync with the most recent
+    /// sample without re-reading IOKit.
+    private func renderBlinkFrame() {
+        guard let button = statusItem.button else { return }
+        let frame: BlinkFrame = (blinkPhase % 2 == 0) ? .fullFill : .empty
+        button.image = composedIcon(percentage: lastBatteryPct, state: lastBatteryState, blink: frame)
     }
 
     /// Rasterizes one icon per party frame. Returning the closure-based
@@ -379,15 +517,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// drawn underneath, with the smiley PNG layered on top. The PNG's
     /// transparent interior lets the fill show through; opaque pixels (outline,
     /// smiley) sit above the fill.
-    private func composedIcon(percentage: Double, state: BatteryState) -> NSImage? {
-        guard let assets = iconAssets else { return nil }
+    /// Optional blink-frame override. .fullFill paints a max-width fill in
+    /// the low-battery color regardless of pct/fill settings; .empty paints
+    /// no fill at all. Both force the frown asset since blink only fires when
+    /// we just entered low-battery state. Used by the warning blink sequence.
+    enum BlinkFrame { case fullFill, empty }
+
+    private func composedIcon(percentage: Double, state: BatteryState, blink: BlinkFrame? = nil) -> NSImage? {
+        // Frown asset for low-battery state (and during blink); smiley elsewhere.
+        // Fall back to smiley if the frown PNG failed to load.
+        let useFrown = blink != nil || fillSlot(percentage: percentage, state: state) == .lowBattery
+        guard let assets = (useFrown ? frownAsset : smileyAsset) ?? smileyAsset else { return nil }
         let scale: CGFloat = 0.38
         let renderSize = NSSize(
             width:  CGFloat(assets.croppedCG.width)  * assets.pxToPt * scale,
             height: CGFloat(assets.croppedCG.height) * assets.pxToPt * scale
         )
-        let fillFraction = max(0, min(1, percentage / 100.0))
-        let fillColor = fillNSColorForBattery(percentage: percentage, state: state)
+        let drawFill: Bool
+        let fillFraction: CGFloat
+        let fillColor: NSColor
+        switch blink {
+        case .fullFill:
+            drawFill = true
+            fillFraction = 1.0
+            fillColor = NSColor(settings.fillLowBatteryColor)
+        case .empty:
+            drawFill = false
+            fillFraction = 0
+            fillColor = NSColor(settings.fillLowBatteryColor)  // unused, for smiley contrast
+        case nil:
+            drawFill = settings.enableFill
+            fillFraction = max(0, min(1, percentage / 100.0))
+            fillColor = fillNSColorForBattery(percentage: percentage, state: state)
+        }
 
         let img = NSImage(size: renderSize, flipped: false) { rect in
             // Fill sits inside the battery body with a transparent gap on all
@@ -405,9 +567,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 height: rect.height - vInset * 2
             )
             // Fill: rounded rect, width = body × fillFraction. Skipped entirely
-            // when the user has Enable Fill turned off (icon shows outline only).
+            // when the user has Enable Fill turned off (or the blink-empty
+            // frame, which also asks for no fill).
             let visibleWidth = bodyRect.width * fillFraction
-            if self.settings.enableFill && visibleWidth > 0.5 {
+            if drawFill && visibleWidth > 0.5 {
                 let fillRect = NSRect(x: bodyRect.minX, y: bodyRect.minY,
                                       width: visibleWidth, height: bodyRect.height)
                 let r = min(cornerRadius, visibleWidth / 2)
@@ -486,7 +649,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Start the rainbow animation iff the *current* fill slot wants party.
     /// State transitions (tick, applySaver, screen wake) and per-state flag
     /// changes all call this — single decision point for animation lifecycle.
+    /// Short-circuits while a warning blink is active; the blink end-of-cycle
+    /// calls refreshIcon which re-enters party if applicable.
     private func syncPartyTimer() {
+        if blinkTimer != nil { return }
         if currentStateIsParty && !screenAsleep {
             ensurePartyAnimation()
         } else {
@@ -605,7 +771,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pct: Int(lastBatteryPct.rounded()),
             enableFill: settings.enableFill,
             enableSmiley: settings.enableSmiley,
-            contrastySmiley: settings.contrastySmiley
+            contrastySmiley: settings.contrastySmiley,
+            useFrown: fillSlot(percentage: lastBatteryPct, state: lastBatteryState) == .lowBattery
         )
         if partyAnimationKey == key, layer.animation(forKey: "party") != nil { return }
 
@@ -826,6 +993,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button,
               let buttonWindow = button.window else { return }
 
+        // Re-check notification permission each time the panel opens — the
+        // user may have flipped it in System Settings since we last checked.
+        // Async, so the banner appears on next layout cycle if state changed.
+        refreshNotificationAuthStatus()
+
         // Anchor the panel's TOP to the bottom of the menu-bar button.
         let buttonRect = buttonWindow.convertToScreen(
             button.convert(button.bounds, to: nil)
@@ -881,7 +1053,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func tick() {
         let cpu = monitor.sampleCPU()
         let gpu = monitor.sampleGPU()
-        let battPct = battery.batteryPercentage() ?? 100
+        // Fall back to the last known good pct (not 100) so a transient IOKit
+        // read failure doesn't mask a real low-battery state. On the very
+        // first tick lastBatteryPct is already primed from launch.
+        let battPct = battery.batteryPercentage() ?? lastBatteryPct
         let charging = battery.isCharging()
         let saverOn = battery.isLowPowerModeEnabled()
         appState.saverOn = saverOn
@@ -892,6 +1067,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let state: BatteryState = charging ? .charging : saverOn ? .saverOn : .saverOff
         lastBatteryPct = battPct
         lastBatteryState = state
+
+        // Fire the warning blink on the transition INTO low-battery. Skipped
+        // while display is asleep — and crucially we ALSO skip updating
+        // prevFillSlot, so when the display wakes the next tick still sees
+        // the pre-sleep slot as "prev" and the now-current low-battery as
+        // "new", and the blink fires for the now-visible user.
+        // First tick (prevFillSlot == nil) doesn't qualify — launching into
+        // already-low state doesn't surprise-blink.
+        let newSlot = fillSlot(percentage: battPct, state: state)
+        if !screenAsleep {
+            if settings.warningBlinkEnabled,
+               let prev = prevFillSlot, prev != .lowBattery, newSlot == .lowBattery {
+                triggerLowBatteryBlink()
+            }
+            prevFillSlot = newSlot
+        }
+
         syncPartyTimer()
         refreshIcon()
         history.append(percentage: battPct, state: state)
@@ -909,6 +1101,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let battHealthy = batt > settings.saverOnAtBatt
         // True iff the current power-source preference wants saver on right now.
         let wantsSaver = !charging || settings.saverOnWhileCharging
+
+        // Streak tracking for the debounced LPM re-engagement. Increments only
+        // while we're in boost mode (saverOn=false) AND all qualifying
+        // conditions hold; any non-qualifying tick resets it. The asymmetry —
+        // immediate boost-off, delayed boost-on — matches the user's intent
+        // that performance comes back fast and goes away slowly.
+        if !saverOn && loadLow && battHealthy && wantsSaver {
+            lowLoadStreak += 1
+        } else {
+            lowLoadStreak = 0
+        }
+
         defer {
             prevHighLoad = highLoad
             prevBattHealthy = battHealthy
@@ -927,29 +1131,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Edge: just unplugged → turn ON saver (we're on battery now). Skip if
         // load is currently high — don't constrain CPU during an active spike;
-        // the load-drop edge below will re-enable saver once load clears.
+        // the debounced streak below will re-enable saver once load clears.
+        // Unplug is an explicit user action, so no debounce here.
         if wasCharging && !charging && !saverOn && loadLow {
+            lowLoadStreak = 0
             applySaver(true)
             return
         }
         // Edge: load transitions low → high AND battery is healthy → turn OFF saver.
+        // Immediate, no debounce — when the user needs performance they need it now.
         if !wasHighLoad && highLoad && battHealthy && saverOn {
             applySaver(false)
             return
         }
-        // Edge: load transitions high → low (below the "on" threshold) → turn ON
-        // saver, but only if the current power-source preference wants it on.
-        if wasHighLoad && loadLow && battHealthy && wantsSaver && !saverOn {
+        // Debounced: load held low for N consecutive ticks → turn ON saver.
+        // Replaces the prior "wasHighLoad && loadLow" edge so brief dips
+        // between sustained bursts don't keep flipping LPM.
+        if lowLoadStreak >= Self.lowLoadReadingsRequired && !saverOn {
+            lowLoadStreak = 0
             applySaver(true)
             return
         }
         // Edge: battery crosses below the threshold → turn ON saver.
+        // Immediate — low battery is urgent.
         if wasBattHealthy && !battHealthy && !saverOn {
             applySaver(true)
         }
     }
 
-    private func applySaver(_ on: Bool) {
+    /// Tracks who initiated a toggle so we can suppress redundant notifications
+    /// (user-initiated → user already knows) and skip fluctuation tracking
+    /// for manual flips.
+    private enum ToggleSource { case auto, manual }
+
+    private func applySaver(_ on: Bool, source: ToggleSource = .auto) {
         isApplyingChange = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -967,19 +1182,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updateMenuBarTitle(percentage: self.lastBatteryPct)
                 self.syncPartyTimer()
                 self.refreshIcon()
-                if self.settings.notificationsEnabled {
+                // Notify only for auto-policy toggles. Manual flips originate
+                // from a user gesture in our own UI, so a notification would
+                // just say "you did the thing you just did."
+                if self.settings.notificationsEnabled, source == .auto {
                     Notifier.shared.notifyToggle(saverOn: on)
+                }
+                // Manual toggles don't count toward fluctuation either —
+                // we're detecting policy flapping, not user activity.
+                if source == .auto {
+                    self.recordAutoToggle()
                 }
             }
         }
     }
 
+    /// Async-queries the OS notification permission and updates appState so
+    /// the inline banner appears/disappears reactively. Called on launch,
+    /// on wake (user may have changed it in System Settings during sleep),
+    /// when the panel opens (same reason), and when the Bettery notifications
+    /// toggle flips to ON (covers first-time enable + re-enable after denial).
+    private func refreshNotificationAuthStatus() {
+        Notifier.shared.checkAuthorizationStatus { [weak self] status in
+            // .notDetermined → never asked; we don't want to scream "blocked"
+            // before the user has even seen the prompt. Only an explicit
+            // .denied triggers the banner.
+            self?.appState.notificationsBlocked = (status == .denied)
+        }
+    }
+
+    /// Appends a timestamp to the rolling window, prunes stale entries, and
+    /// fires the fluctuation notification if (a) the count crosses the
+    /// threshold, (b) notifications are enabled, and (c) we haven't already
+    /// notified during this wake cycle. The flag is cleared on
+    /// NSWorkspace.didWakeNotification.
+    private func recordAutoToggle() {
+        let now = Date()
+        autoToggleTimes.append(now)
+        autoToggleTimes.removeAll { now.timeIntervalSince($0) > Self.fluctuationWindow }
+        guard autoToggleTimes.count >= Self.fluctuationThreshold else { return }
+        guard settings.notificationsEnabled, !hasNotifiedFluctuation else { return }
+        hasNotifiedFluctuation = true
+        Notifier.shared.notifyFluctuation()
+    }
+
     // User flipped the saver in our menu. Disable autoBoost so the auto policy
     // doesn't immediately undo their choice on the next tick — the user re-enables
-    // autoBoost when they want the system to take over again.
+    // autoBoost when they want the system to take over again. Also cancels any
+    // active warning blink so the user's intended state shows immediately
+    // instead of sitting through up to 3 sec of blink frames.
     private func manualToggle(_ on: Bool) {
+        cancelBlinkIfActive()
         settings.autoBoost = false
-        applySaver(on)
+        applySaver(on, source: .manual)
+    }
+
+    /// Tears down the blink timer without forcing a redraw — the applySaver
+    /// completion that follows will repaint. Idempotent.
+    private func cancelBlinkIfActive() {
+        guard blinkTimer != nil else { return }
+        blinkTimer?.invalidate()
+        blinkTimer = nil
+        blinkPhase = 0
     }
 
     /// Single entrypoint for "re-check what state the app should be in now."
@@ -1001,7 +1265,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isApplyingChange else { return }
         let cpu = monitor.sampleCPU()
         let gpu = monitor.sampleGPU()
-        let batt = battery.batteryPercentage() ?? 100
+        // Same fallback as tick(): last known good rather than 100 so a
+        // transient nil from IOKit doesn't mask low-battery.
+        let batt = battery.batteryPercentage() ?? lastBatteryPct
         let charging = battery.isCharging()
         let saverOn = battery.isLowPowerModeEnabled()
 

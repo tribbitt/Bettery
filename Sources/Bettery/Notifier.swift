@@ -22,6 +22,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Async query of the OS-level permission state. Used by AppDelegate to
+    /// surface an in-app banner when the user has Bettery notifications enabled
+    /// but macOS has them blocked (otherwise notifyToggle / notifyFluctuation
+    /// fail silently and the user has no signal). Completion is on the main
+    /// queue for direct binding to @Published state.
+    func checkAuthorizationStatus(completion: @escaping (UNAuthorizationStatus) -> Void) {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async {
+                completion(settings.authorizationStatus)
+            }
+        }
+    }
+
     func notifyToggle(saverOn: Bool) {
         let content = UNMutableNotificationContent()
         content.title = "Bettery Toggled Low-Power Mode"
@@ -36,6 +49,24 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
                 NSLog("Bettery: notification add failed: \(error)")
+            }
+        }
+    }
+
+    func notifyFluctuation() {
+        let content = UNMutableNotificationContent()
+        content.title = "CPU/GPU usage fluctuating."
+        content.body = "Bettery may be less effective."
+        content.sound = nil
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                NSLog("Bettery: fluctuation notification failed: \(error)")
             }
         }
     }

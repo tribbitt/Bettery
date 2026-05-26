@@ -46,7 +46,7 @@ final class BatteryManager {
             switch state {
             case kIOPSACPowerValue:      return "AC Power"
             case kIOPSBatteryPowerValue: return "Battery"
-            case kIOPSOffLineValue:      return "Off Line"
+            case kIOPSOffLineValue:      return "Offline"
             default:                     return state
             }
         } ?? "Unknown"

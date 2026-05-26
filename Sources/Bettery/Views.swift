@@ -61,16 +61,18 @@ struct BatteryGraphView: View {
                             }
                         }
                     }
-                    // Sleep segments: user-picked gray fill + thin white diagonal lines,
-                    // all clipped to the polygon shape — so the pattern stops
-                    // at the data line instead of running full chart height.
+                    // Sleep segments: user-picked gray fill + thin dimmed-white
+                    // diagonal lines, all clipped to the polygon shape — so the
+                    // pattern stops at the data line instead of running full
+                    // chart height. Fill is fully opaque (no .opacity modifier)
+                    // so the awake-segment fills beneath don't bleed through.
                     Canvas { ctx, size in
                         for seg in segs where seg.isSleep {
-                            ctx.fill(seg.path, with: .color(settings.graphSleepColor.opacity(0.9)))
+                            ctx.fill(seg.path, with: .color(settings.graphSleepColor))
                             ctx.drawLayer { layer in
                                 layer.clip(to: seg.path)
                                 drawDiagonalHatch(in: &layer, size: size,
-                                                  color: .white,
+                                                  color: Color(white: 0.75),
                                                   opacity: 0.95,
                                                   lineWidth: 0.6)
                             }
@@ -345,11 +347,15 @@ struct OptionsView: View {
 
             Divider()
 
-            toggleRow(label: "Auto-Boost Performance", value: $settings.autoBoost)
-                .padding(.vertical, 4)
-            Divider()
             toggleRow(label: "Notifications", value: $settings.notificationsEnabled)
                 .padding(.bottom, 4)
+
+            // Only surface the macOS-blocked warning when the user actively
+            // wants notifications — silent otherwise so the banner doesn't
+            // appear for users who deliberately disabled the Bettery toggle.
+            if settings.notificationsEnabled && appState.notificationsBlocked {
+                notificationsBlockedBanner
+            }
 
             if settings.autoBoost {
                 sectionHeader(label: "Toggle Thresholds", expanded: $showThresholds)
@@ -404,8 +410,9 @@ struct OptionsView: View {
                     toggleRow(label: "Battery Percentage", value: $settings.showPercentage)
                     toggleRow(label: "Smiley",             value: $settings.enableSmiley)
                     if settings.enableSmiley {
-                        toggleRow(label: "Contrast Smiley", value: $settings.contrastySmiley)
+                        toggleRow(label: "Dark Smiley", value: $settings.contrastySmiley)
                     }
+                    toggleRow(label: "Warning Blink at Low Battery", value: $settings.warningBlinkEnabled)
                     Button("Restore Default Colors") {
                         settings.restoreDefaultColors()
                     }
@@ -426,7 +433,7 @@ struct OptionsView: View {
                     NSWorkspace.shared.open(url)
                 }
             } label: {
-                Text("System Battery Settings")
+                Text("Open System Battery Settings")
                     .font(settings.font(size: 13))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
@@ -436,16 +443,53 @@ struct OptionsView: View {
 
             Divider().padding(.vertical, 4)
 
-            Button("Restore Default Settings") {
+            // Same plain-row visual style as the System Battery row above.
+            Button {
                 settings.restoreDefaultSettings()
+            } label: {
+                Text("Restore Default Settings")
+                    .font(settings.font(size: 13))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .padding(.vertical, 7)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.bottom, 4)
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
+    }
+
+    /// Banner shown beneath the Notifications toggle when macOS has blocked
+    /// the permission. Mirrors the sudoers banner pattern up top: a single
+    /// tap target that opens the relevant System Settings pane.
+    private var notificationsBlockedBanner: some View {
+        Button {
+            // Apple doesn't expose a public deep-link to a per-app Notifications
+            // page; the user lands on the Notifications list and selects Bettery.
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") {
+                NSWorkspace.shared.open(url)
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "bell.slash")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Notifications Blocked by macOS")
+                    .font(settings.font(size: 12, weight: .medium))
+                Spacer()
+                Text("Open Settings")
+                    .font(settings.font(size: 10))
+                    .foregroundColor(.white.opacity(0.7))
+            }
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.orange)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .padding(.bottom, 4)
     }
 
     // Header row with chevron — mirrors the style of the outer Options toggle so
@@ -687,6 +731,16 @@ struct MainMenuView: View {
 
             Divider()
 
+            menuRow(label: "Automatic Energy Mode", verticalPadding: 7,
+                    action: { settings.autoBoost.toggle() }) {
+                Toggle("", isOn: $settings.autoBoost)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .allowsHitTesting(false)
+            }
+
+            Divider()
+
             menuRow(label: "Low-Power Mode", verticalPadding: 7,
                     action: { onToggle(!state.saverOn) }) {
                 Toggle("", isOn: Binding(get: { state.saverOn },
@@ -847,4 +901,9 @@ final class AppState: ObservableObject {
     // nil = no fill picker currently open; AppDelegate observes and updates
     // NSColorPanel.shared.accessoryView accordingly.
     @Published var activeFillSlot: FillSlot? = nil
+    // True iff macOS has explicitly denied notifications for Bettery — drives
+    // the inline "blocked" banner under the Notifications toggle. Stays false
+    // for .notDetermined / .authorized / .provisional / .ephemeral so we don't
+    // warn before the first auth check returns, or for the happy path.
+    @Published var notificationsBlocked: Bool = false
 }

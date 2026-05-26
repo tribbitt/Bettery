@@ -35,14 +35,20 @@ final class Settings: ObservableObject {
         static let fillStandardParty   = "fillStandardParty"
         static let fillSaverParty      = "fillSaverParty"
         static let fillLowBatteryParty = "fillLowBatteryParty"
+        static let warningBlink        = "warningBlinkEnabled"
     }
 
     // MARK: - Defaults (constants used by both register-step and restore-buttons)
 
-    static let defaultCPUOn: Double = 90
-    static let defaultGPUOn: Double = 90
-    static let defaultCPUOff: Double = 90
-    static let defaultGPUOff: Double = 90
+    // 10-point hysteresis band between on (75) and off (85) — cushions the
+    // edge-triggered auto-boost policy against load that wavers across the
+    // threshold. Users can collapse the band to 0 by setting on == off; the
+    // didSet clamp prevents the inverted (on > off) configuration but doesn't
+    // enforce a minimum gap.
+    static let defaultCPUOn: Double = 75
+    static let defaultGPUOn: Double = 75
+    static let defaultCPUOff: Double = 85
+    static let defaultGPUOff: Double = 85
     static let defaultBattOn: Double = 25
     static let defaultSaverWhileCharging: Bool = false
     static let defaultFontFamily: String = "system"
@@ -53,6 +59,7 @@ final class Settings: ObservableObject {
     static let defaultNotificationsEnabled: Bool = true
     static let defaultShowPercentage: Bool = true
     static let defaultFillParty: Bool = false
+    static let defaultWarningBlink: Bool = true
 
     // Defaults match the previously hardcoded colors in BatteryGraphView.
     static let defaultStandardColor: Color = .white
@@ -70,10 +77,37 @@ final class Settings: ObservableObject {
 
     // MARK: - Threshold settings
 
-    @Published var saverOnAtCPU: Double { didSet { defaults.set(saverOnAtCPU, forKey: Keys.cpuOn) } }
-    @Published var saverOnAtGPU: Double { didSet { defaults.set(saverOnAtGPU, forKey: Keys.gpuOn) } }
-    @Published var saverOffAtCPU: Double { didSet { defaults.set(saverOffAtCPU, forKey: Keys.cpuOff) } }
-    @Published var saverOffAtGPU: Double { didSet { defaults.set(saverOffAtGPU, forKey: Keys.gpuOff) } }
+    // The on/off pairs are clamped to on <= off so the policy can never end up
+    // in the inverted state (would mean "saver turns off below X% load AND
+    // turns on above Y% load" with X > Y, which has no valid load range). The
+    // clamp converges in one pass: once the invariant holds the reciprocal
+    // didSet is a no-op. didSet does NOT fire during initial assignment in
+    // init, so cross-reading the other property is safe even before its own
+    // init line runs.
+    @Published var saverOnAtCPU: Double {
+        didSet {
+            defaults.set(saverOnAtCPU, forKey: Keys.cpuOn)
+            if saverOffAtCPU < saverOnAtCPU { saverOffAtCPU = saverOnAtCPU }
+        }
+    }
+    @Published var saverOnAtGPU: Double {
+        didSet {
+            defaults.set(saverOnAtGPU, forKey: Keys.gpuOn)
+            if saverOffAtGPU < saverOnAtGPU { saverOffAtGPU = saverOnAtGPU }
+        }
+    }
+    @Published var saverOffAtCPU: Double {
+        didSet {
+            defaults.set(saverOffAtCPU, forKey: Keys.cpuOff)
+            if saverOnAtCPU > saverOffAtCPU { saverOnAtCPU = saverOffAtCPU }
+        }
+    }
+    @Published var saverOffAtGPU: Double {
+        didSet {
+            defaults.set(saverOffAtGPU, forKey: Keys.gpuOff)
+            if saverOnAtGPU > saverOffAtGPU { saverOnAtGPU = saverOffAtGPU }
+        }
+    }
     @Published var saverOnAtBatt: Double { didSet { defaults.set(saverOnAtBatt, forKey: Keys.battOn) } }
     @Published var saverOnWhileCharging: Bool { didSet { defaults.set(saverOnWhileCharging, forKey: Keys.saverWhileCharging) } }
     @Published var iconStyle: String { didSet { defaults.set(iconStyle, forKey: Keys.iconStyle) } }
@@ -102,6 +136,7 @@ final class Settings: ObservableObject {
     @Published var fillStandardParty: Bool     { didSet { defaults.set(fillStandardParty,      forKey: Keys.fillStandardParty) } }
     @Published var fillSaverParty: Bool        { didSet { defaults.set(fillSaverParty,         forKey: Keys.fillSaverParty) } }
     @Published var fillLowBatteryParty: Bool   { didSet { defaults.set(fillLowBatteryParty,    forKey: Keys.fillLowBatteryParty) } }
+    @Published var warningBlinkEnabled: Bool   { didSet { defaults.set(warningBlinkEnabled,    forKey: Keys.warningBlink) } }
 
     private init() {
         defaults.register(defaults: [
@@ -122,7 +157,8 @@ final class Settings: ObservableObject {
             Keys.fillChargingParty:     Self.defaultFillParty,
             Keys.fillStandardParty:     Self.defaultFillParty,
             Keys.fillSaverParty:        Self.defaultFillParty,
-            Keys.fillLowBatteryParty:   Self.defaultFillParty
+            Keys.fillLowBatteryParty:   Self.defaultFillParty,
+            Keys.warningBlink:          Self.defaultWarningBlink
         ])
         self.saverOnAtCPU         = defaults.double(forKey: Keys.cpuOn)
         self.saverOnAtGPU         = defaults.double(forKey: Keys.gpuOn)
@@ -150,6 +186,7 @@ final class Settings: ObservableObject {
         self.fillStandardParty    = defaults.bool(forKey: Keys.fillStandardParty)
         self.fillSaverParty       = defaults.bool(forKey: Keys.fillSaverParty)
         self.fillLowBatteryParty  = defaults.bool(forKey: Keys.fillLowBatteryParty)
+        self.warningBlinkEnabled  = defaults.bool(forKey: Keys.warningBlink)
     }
 
     // MARK: - Restore

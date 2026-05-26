@@ -11,7 +11,8 @@ let package = Package(
             name: "Bettery",
             path: "Sources/Bettery",
             resources: [
-                .copy("Resources/betterywhiteicon.png")
+                .copy("Resources/betterywhiteicon.png"),
+                .copy("Resources/betterywhitefrownicon.png")
             ]
         )
     ]
